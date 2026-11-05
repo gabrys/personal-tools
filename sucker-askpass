@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Sudo askpass helper: zenity sends the secret directly to sudo over stdout."""
+
+import os
+
+
+def main():
+    # Never capture, print, persist, or put the secret in process arguments.
+    # sudo runs this helper as the desktop user and reads its stdout privately.
+    os.execv("/usr/bin/zenity", ["zenity", "--entry", "--hide-text",
+                               "--title=Docker PIN", "--text=",
+                               "--ok-label=Unlock", "--cancel-label=Cancel"])
+
+
+if __name__ == "__main__":
+    main()

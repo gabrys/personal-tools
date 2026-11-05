@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Install the dedicated sucker account, broker and password-protected sudo rule."""
+
+import argparse
+import grp
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import subprocess
+import tempfile
+
+
+BROKER = Path("/usr/local/libexec/sucker-broker")
+ASKPASS = Path("/usr/local/libexec/sucker-askpass")
+
+
+def sudo_rule(user):
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", user):
+        raise ValueError("Unsupported login name.")
+    alias = "SUCKER_BROKER_" + user.encode().hex().upper()
+    return (f"# Installed by sucker-setup; authentication is required.\n"
+            f"Cmnd_Alias {alias} = /usr/bin/python3 -I {BROKER} __broker\n"
+            f"Defaults!{alias} targetpw\n"
+            f"{user} ALL=(sucker) PASSWD: {alias}\n")
+
+
+def configure_pin(force=False):
+    status = subprocess.run(["passwd", "-S", "sucker"], check=True, capture_output=True, text=True)
+    change = force or status.stdout.split()[1] != "P"
+    if not change:
+        try:
+            change = input("Change Docker PIN? [y/N] ").strip().lower() in {"y", "yes"}
+        except EOFError:
+            change = False
+    if change:
+        print("Set the Docker PIN (password for account sucker):", flush=True)
+        subprocess.run(["passwd", "sucker"], check=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--user", default=os.environ.get("SUDO_USER"),
+                        help="desktop user allowed to start the broker (default: SUDO_USER)")
+    parser.add_argument("--set-pin", action="store_true",
+                        help="set/reset the Docker PIN (password of account sucker)")
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        parser.error("run with sudo: sudo ./sucker-setup")
+    if not args.user or args.user in {"root", "sucker"}:
+        parser.error("specify the ordinary desktop user with --user")
+    policy = sudo_rule(args.user)
+    pwd.getpwnam(args.user)
+    grp.getgrnam("docker")
+    for program in ("useradd", "usermod", "visudo", "passwd", "tmux", "zenity", "docker"):
+        if not shutil.which(program):
+            parser.error(f"missing dependency: {program}")
+    source = Path(__file__).resolve().with_name("sucker")
+    helper = source.with_name("sucker-askpass")
+    if not source.is_file() or not helper.is_file():
+        parser.error("run this installer beside sucker and sucker-askpass")
+    try:
+        account = pwd.getpwnam("sucker")
+        if account.pw_dir != "/var/lib/sucker" or not account.pw_shell.endswith("/nologin"):
+            parser.error("existing account sucker does not match the dedicated service account")
+    except KeyError:
+        subprocess.run(["useradd", "--system", "--user-group", "--create-home",
+                        "--home-dir", "/var/lib/sucker", "--shell", "/usr/sbin/nologin",
+                        "--groups", "docker", "sucker"], check=True)
+    account = pwd.getpwnam("sucker")
+    if grp.getgrnam("docker").gr_gid not in os.getgrouplist("sucker", account.pw_gid):
+        subprocess.run(["usermod", "--append", "--groups", "docker", "sucker"], check=True)
+    configure_pin(args.set_pin)
+    BROKER.parent.mkdir(parents=True, exist_ok=True)
+    for origin, destination in ((source, BROKER), (helper, ASKPASS)):
+        descriptor, temporary = tempfile.mkstemp(prefix=".sucker-", dir=destination.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(origin.read_bytes())
+            os.chmod(temporary, 0o755)
+            os.replace(temporary, destination)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+    directory = Path("/etc/sudoers.d")
+    descriptor, temporary = tempfile.mkstemp(prefix=".sucker-", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(policy)
+        os.chmod(temporary, 0o440)
+        subprocess.run(["visudo", "-c", "-f", temporary], check=True)
+        os.replace(temporary, directory / f"sucker-{args.user}")
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    print(f"Installed broker as user sucker; {args.user} unlocks it with the Docker PIN in zenity.")
+    print("Copy sucker to ~/.local/bin/sucker as your ordinary user. Re-run setup after broker updates.")
+
+
+if __name__ == "__main__":
+    main()

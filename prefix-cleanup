@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Interactively shorten allowed Codex command prefixes (stdlib only)."""
+
+import argparse
+import ast
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+
+
+def allowed_rules(source):
+    """Parse data without executing the rules file; retain source locations."""
+    lines = source.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+
+    def position(line, byte_column):
+        # AST columns are UTF-8 byte offsets, not character offsets.
+        return offsets[line - 1] + len(
+            lines[line - 1].encode("utf-8")[:byte_column].decode("utf-8")
+        )
+
+    rules = []
+    for statement in ast.parse(source).body:
+        if not isinstance(statement, ast.Expr):
+            continue
+        call = statement.value
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                and call.func.id == "prefix_rule" and not call.args):
+            continue
+        keywords = {item.arg: item.value for item in call.keywords}
+        # Extra rule attributes may affect semantics: leave them untouched.
+        if set(keywords) != {"pattern", "decision"} or len(call.keywords) != 2:
+            continue
+        try:
+            pattern = ast.literal_eval(keywords["pattern"])
+            decision = ast.literal_eval(keywords["decision"])
+        except (ValueError, TypeError):
+            continue
+        if (decision != "allow" or not isinstance(pattern, list)
+                or not pattern or not all(isinstance(x, str) for x in pattern)):
+            continue
+        node = keywords["pattern"]
+        rules.append({
+            "pattern": pattern,
+            "span": (position(statement.lineno, statement.col_offset),
+                     position(statement.end_lineno, statement.end_col_offset)),
+            "pattern_span": (position(node.lineno, node.col_offset),
+                             position(node.end_lineno, node.end_col_offset)),
+        })
+    return rules
+
+
+def covered(pattern, prefixes):
+    return any(len(prefix) < len(pattern) and pattern[:len(prefix)] == prefix
+               for prefix in prefixes)
+
+
+def proposals(source):
+    rules = allowed_rules(source)
+    prefixes = [row["pattern"] for row in rules]
+    groups = {}
+    for row in rules:
+        if len(row["pattern"]) > 2:
+            prefix = row["pattern"][:2]
+            if prefix not in prefixes and not covered(prefix, prefixes):
+                groups.setdefault(tuple(prefix), []).append(row)
+    return groups
+
+
+def simplify(source, ask=input):
+    selected = []
+    for prefix in proposals(source):
+        command = json.dumps(" ".join(prefix) + " ...", ensure_ascii=True)
+        if ask(f"Allow {command}? [Y/n] ").strip().lower() in {"", "y", "yes"}:
+            selected.append(prefix)
+
+    count = 0
+    if selected and ask(f"Add {len(selected)} rule(s)? [y/N] ").strip().lower() in {"y", "yes"}:
+        newline = "\r\n" if "\r\n" in source else "\n"
+        if source and not source.endswith("\n"):
+            source += newline
+        for prefix in selected:
+            target = json.dumps(prefix, ensure_ascii=True)
+            source += f'prefix_rule(pattern={target}, decision="allow"){newline}'
+        count += len(selected)
+
+    rules = allowed_rules(source)
+    prefixes = [row["pattern"] for row in rules]
+    redundant = [row for row in rules if covered(row["pattern"], prefixes)]
+    if redundant and ask(
+        f"Remove {len(redundant)} rule(s) covered by shorter prefixes? [y/N] "
+    ).strip().lower() in {"y", "yes"}:
+        for row in sorted(redundant, key=lambda row: row["span"], reverse=True):
+            start, end = row["span"]
+            source = source[:start] + source[end:]
+        source = "".join(line for line in source.splitlines(keepends=True) if line.strip())
+        count += len(redundant)
+    return source, count
+
+
+def save(path, original, updated):
+    if path.read_bytes() != original:
+        raise OSError("File changed during cleanup; save aborted.")
+    descriptor, backup_name = tempfile.mkstemp(prefix=path.name + ".bak-", dir=path.parent)
+    os.close(descriptor)
+    backup = Path(backup_name)
+    shutil.copy2(path, backup)
+    descriptor, temporary_name = tempfile.mkstemp(prefix="." + path.name + "-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(updated.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        shutil.copymode(path, temporary_name)
+        if path.read_bytes() != original:
+            raise OSError("File changed during cleanup; save aborted.")
+        os.replace(temporary_name, path)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+    return backup
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("file", type=Path, help="rules file to clean up")
+    args = parser.parse_args()
+    try:
+        path = args.file.resolve(strict=True)
+        original = path.read_bytes()
+        updated, count = simplify(original.decode("utf-8"))
+        if not count:
+            print("No changes.")
+            return 0
+        backup = save(path, original, updated)
+        print(f"Saved {count} rule change(s). Backup: {backup}")
+        return 0
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled. File was not saved.", file=sys.stderr)
+        return 130
+    except (OSError, UnicodeError, SyntaxError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
