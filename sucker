@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Run individually approved Docker commands; authenticate once in tmux."""
 
+import argparse
 import array
 import fcntl
+import grp
 import html
 import json
 import os
 from pathlib import Path
 import pwd
 import queue
+import re
 import select
 import shlex
 import shutil
@@ -80,9 +83,9 @@ def ensure_broker():
                 raise ValueError("Broker is stopping; retry shortly.")
             return endpoint
         if not Path(BROKER).is_file():
-            raise ValueError("Broker is not installed. Run sudo ./sucker-setup once from the repository.")
+            raise ValueError("Broker is not installed. Run sudo ./sucker broker setup from the repository.")
         if not Path(ASKPASS).is_file():
-            raise ValueError("Docker PIN helper is not installed. Re-run sudo ./sucker-setup.")
+            raise ValueError("Docker PIN helper is not installed. Re-run sudo ./sucker broker setup.")
         if not shutil.which("tmux"):
             raise ValueError("tmux is required. Install it before running sucker.")
         if not Path("/usr/bin/zenity").is_file():
@@ -497,15 +500,117 @@ def request(endpoint, arguments, cwd=None, descriptors=None):
                 raise
 
 
+def askpass():
+    # Never capture, print, persist, or put the secret in process arguments.
+    # sudo runs this helper as the desktop user and reads stdout privately.
+    os.execv("/usr/bin/zenity", ["zenity", "--entry", "--hide-text",
+                               "--title=Docker PIN", "--text=",
+                               "--ok-label=Unlock", "--cancel-label=Cancel"])
+
+
+def sudo_rule(user):
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", user):
+        raise ValueError("Unsupported login name.")
+    alias = "SUCKER_BROKER_" + user.encode().hex().upper()
+    return (f"# Installed by sucker broker setup; authentication is required.\n"
+            f"Cmnd_Alias {alias} = /usr/bin/python3 -I {BROKER} __broker\n"
+            f"Defaults!{alias} targetpw\n"
+            f"{user} ALL=(sucker) PASSWD: {alias}\n")
+
+
+def configure_pin(force=False):
+    status = subprocess.run(["passwd", "-S", BROKER_USER], check=True,
+                            capture_output=True, text=True)
+    change = force or status.stdout.split()[1] != "P"
+    if not change:
+        try:
+            change = input("Change Docker PIN? [y/N] ").strip().lower() in {"y", "yes"}
+        except EOFError:
+            change = False
+    if change:
+        print("Set the Docker PIN (password for account sucker):", flush=True)
+        subprocess.run(["passwd", BROKER_USER], check=True)
+
+
+def install_main(arguments):
+    parser = argparse.ArgumentParser(
+        prog="sucker broker setup",
+        description="Install the dedicated sucker account, broker and password-protected sudo rule.")
+    parser.add_argument("--user", default=os.environ.get("SUDO_USER"),
+                        help="desktop user allowed to start the broker (default: SUDO_USER)")
+    parser.add_argument("--set-pin", action="store_true",
+                        help="set/reset the Docker PIN (password of account sucker)")
+    args = parser.parse_args(arguments)
+    if os.geteuid() != 0:
+        parser.error("run with sudo: sudo ./sucker broker setup")
+    if not args.user or args.user in {"root", BROKER_USER}:
+        parser.error("specify the ordinary desktop user with --user")
+
+    policy = sudo_rule(args.user)
+    pwd.getpwnam(args.user)
+    docker_group = grp.getgrnam("docker")
+    for program in ("useradd", "usermod", "visudo", "passwd", "tmux", "zenity", "docker"):
+        if not shutil.which(program):
+            parser.error(f"missing dependency: {program}")
+
+    source = Path(__file__).resolve()
+    if not source.is_file():
+        parser.error("cannot find the sucker script to install")
+    try:
+        account = pwd.getpwnam(BROKER_USER)
+        if account.pw_dir != "/var/lib/sucker" or not account.pw_shell.endswith("/nologin"):
+            parser.error("existing account sucker does not match the dedicated service account")
+    except KeyError:
+        subprocess.run(["useradd", "--system", "--user-group", "--create-home",
+                        "--home-dir", "/var/lib/sucker", "--shell", "/usr/sbin/nologin",
+                        "--groups", "docker", BROKER_USER], check=True)
+    account = pwd.getpwnam(BROKER_USER)
+    if docker_group.gr_gid not in os.getgrouplist(BROKER_USER, account.pw_gid):
+        subprocess.run(["usermod", "--append", "--groups", "docker", BROKER_USER], check=True)
+    configure_pin(args.set_pin)
+
+    broker_path = Path(BROKER)
+    askpass_path = Path(ASKPASS)
+    broker_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".sucker-", dir=broker_path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(source.read_bytes())
+        os.chmod(temporary, 0o755)
+        os.replace(temporary, broker_path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+    descriptor, temporary = tempfile.mkstemp(prefix=".sucker-askpass-", dir=askpass_path.parent)
+    os.close(descriptor)
+    os.unlink(temporary)
+    try:
+        os.symlink(broker_path, temporary)
+        os.replace(temporary, askpass_path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+    directory = Path("/etc/sudoers.d")
+    descriptor, temporary = tempfile.mkstemp(prefix=".sucker-", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(policy)
+        os.chmod(temporary, 0o440)
+        subprocess.run(["visudo", "-c", "-f", temporary], check=True)
+        os.replace(temporary, directory / f"sucker-{args.user}")
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    print(f"Installed broker as user sucker; {args.user} unlocks it with the Docker PIN in zenity.")
+    print("Copy sucker to ~/.local/bin/sucker as your ordinary user. Re-run setup after broker updates.")
+
+
 def setup_broker(arguments):
-    installer = Path(__file__).resolve().with_name("sucker-setup")
-    if not installer.is_file():
-        raise ValueError("Setup requires the repository version of sucker with sucker-setup beside it.")
-    command = ["/usr/bin/python3", "-I", str(installer), *arguments]
-    # Setup changes system accounts and sudoers, so it uses ordinary admin
-    # authentication rather than the Docker PIN/broker permission.
-    if os.geteuid() != 0 and "--help" not in arguments and "-h" not in arguments:
-        command = ["sudo", "--", *command]
+    # Setup changes system accounts and sudoers, so use normal admin sudo,
+    # not the Docker PIN or the broker's restricted sudo permission.
+    if os.geteuid() == 0 or "--help" in arguments or "-h" in arguments:
+        return install_main(arguments)
+    command = ["sudo", "--", "/usr/bin/python3", "-I",
+               str(Path(__file__).resolve()), "__setup", *arguments]
     status = subprocess.run(command).returncode
     return status if status >= 0 else 128 - status
 
@@ -513,6 +618,11 @@ def setup_broker(arguments):
 def main():
     arguments = sys.argv[1:]
     try:
+        if Path(sys.argv[0]).name == Path(ASKPASS).name:
+            askpass()
+            return 0
+        if arguments[:1] == ["__setup"]:
+            return install_main(arguments[1:])
         if arguments[:1] == ["__broker"]:
             if (len(arguments) != 1 or "SUDO_UID" not in os.environ or
                     os.geteuid() != pwd.getpwnam(BROKER_USER).pw_uid):
@@ -524,8 +634,12 @@ def main():
                 raise ValueError("Invalid host arguments.")
             host(json.loads(arguments[1]))
             return 0
+        if arguments == ["askpass"]:
+            askpass()
+            return 0
         if not arguments or arguments == ["--help"]:
             print("Usage: sucker DOCKER_ARGS ...\n"
+                  "       sucker askpass\n"
                   "       sucker broker {start|stop|restart|setup}\n"
                   "First command opens Docker PIN; every command needs separate GUI approval.")
             return 0

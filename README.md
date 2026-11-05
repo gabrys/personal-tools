@@ -8,6 +8,8 @@ once in Zenity; approve each command in a separate dialog.
 Docker runs as the `sucker` user. The tool uses Python's standard library only.
 To install, run `./sucker broker setup`, then link `~/.local/bin/sucker` to the
 script in this repository.
+`sucker askpass` opens the masked Docker PIN prompt and writes the entered PIN
+to stdout for programs that use the askpass protocol.
 
 ## prefix-cleanup
 
