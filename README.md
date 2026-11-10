@@ -24,11 +24,16 @@ Requires Python 3.9+ and uses the standard library only.
 The rules file path is required.
 
 The tool displays one single-line prompt for each proposal, such as
-`Allow "git add ..."? [Y/n]`. Press Enter or `y`/`yes` to accept a prefix, or
-`n` to skip it. Then `Add N rule(s)? [y/N]` confirms adding the selected rules
-(Enter declines). A separate prompt, `Remove N rule(s) covered by shorter
-prefixes? [y/N]`, offers to remove rules covered by existing or newly added
-prefixes (Enter keeps them). Batch prompts appear only when N > 0.
+`Prefix "git add ..."? [A]llow [p]rompt [d]eny [s]kip` (the capital letter
+marks the default). Answer `a` (or Enter) to add the prefix with
+`decision="allow"`, `p` for `decision="prompt"` (always ask), `d` for
+`decision="forbidden"`, or `s` to skip it; other answers repeat the question.
+Prompt and deny rules do not make longer allow rules redundant, and prefixes
+that already have a rule are not proposed again. Then `Add N rule(s)? [y/N]`
+confirms adding the selected rules (Enter declines).
+A separate prompt, `Remove N rule(s) covered by shorter prefixes? [y/N]`,
+offers to remove rules covered by existing or newly added prefixes (Enter keeps
+them). Batch prompts appear only when N > 0.
 
 Shortening a rule grants permission for every argument sequence after the
 selected prefix. Adding and removing rules require separate confirmations.

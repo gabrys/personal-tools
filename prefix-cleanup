@@ -11,7 +11,7 @@ import sys
 import tempfile
 
 
-def allowed_rules(source):
+def allowed_rules(source, decisions=("allow",)):
     """Parse data without executing the rules file; retain source locations."""
     lines = source.splitlines(keepends=True)
     offsets = [0]
@@ -41,12 +41,13 @@ def allowed_rules(source):
             decision = ast.literal_eval(keywords["decision"])
         except (ValueError, TypeError):
             continue
-        if (decision != "allow" or not isinstance(pattern, list)
+        if (decision not in decisions or not isinstance(pattern, list)
                 or not pattern or not all(isinstance(x, str) for x in pattern)):
             continue
         node = keywords["pattern"]
         rules.append({
             "pattern": pattern,
+            "decision": decision,
             "span": (position(statement.lineno, statement.col_offset),
                      position(statement.end_lineno, statement.end_col_offset)),
             "pattern_span": (position(node.lineno, node.col_offset),
@@ -63,30 +64,44 @@ def covered(pattern, prefixes):
 def proposals(source):
     rules = allowed_rules(source)
     prefixes = [row["pattern"] for row in rules]
+    # A prefix that already has a rule of any decision is not proposed again.
+    existing = [row["pattern"] for row in
+                allowed_rules(source, ("allow", "prompt", "forbidden"))]
     groups = {}
     for row in rules:
         if len(row["pattern"]) > 2:
             prefix = row["pattern"][:2]
-            if prefix not in prefixes and not covered(prefix, prefixes):
+            if prefix not in existing and not covered(prefix, prefixes):
                 groups.setdefault(tuple(prefix), []).append(row)
     return groups
+
+
+# Enter allows, as before; unknown answers ask again.
+DECISIONS = {"": "allow", "a": "allow", "allow": "allow",
+             "p": "prompt", "prompt": "prompt",
+             "d": "forbidden", "deny": "forbidden",
+             "s": None, "skip": None}
 
 
 def simplify(source, ask=input):
     selected = []
     for prefix in proposals(source):
         command = json.dumps(" ".join(prefix) + " ...", ensure_ascii=True)
-        if ask(f"Allow {command}? [Y/n] ").strip().lower() in {"", "y", "yes"}:
-            selected.append(prefix)
+        while True:
+            answer = ask(f"Prefix {command}? [A]llow [p]rompt [d]eny [s]kip ").strip().lower()
+            if answer in DECISIONS:
+                break
+        if DECISIONS[answer]:
+            selected.append((prefix, DECISIONS[answer]))
 
     count = 0
     if selected and ask(f"Add {len(selected)} rule(s)? [y/N] ").strip().lower() in {"y", "yes"}:
         newline = "\r\n" if "\r\n" in source else "\n"
         if source and not source.endswith("\n"):
             source += newline
-        for prefix in selected:
-            target = json.dumps(prefix, ensure_ascii=True)
-            source += f'prefix_rule(pattern={target}, decision="allow"){newline}'
+        for prefix, decision in selected:
+            target = json.dumps(list(prefix), ensure_ascii=True)
+            source += f'prefix_rule(pattern={target}, decision="{decision}"){newline}'
         count += len(selected)
 
     rules = allowed_rules(source)
