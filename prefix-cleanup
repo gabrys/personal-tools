@@ -6,6 +6,7 @@ import ast
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import sys
 import tempfile
@@ -61,37 +62,63 @@ def covered(pattern, prefixes):
                for prefix in prefixes)
 
 
-def proposals(source):
-    rules = allowed_rules(source)
-    prefixes = [row["pattern"] for row in rules]
+def group(rows, length, source):
+    """Group rules longer than `length` by their first `length` elements."""
+    prefixes = [row["pattern"] for row in allowed_rules(source)]
     # A prefix that already has a rule of any decision is not proposed again.
     existing = [row["pattern"] for row in
                 allowed_rules(source, ("allow", "prompt", "forbidden"))]
     groups = {}
-    for row in rules:
-        if len(row["pattern"]) > 2:
-            prefix = row["pattern"][:2]
+    for row in rows:
+        if len(row["pattern"]) > length:
+            prefix = row["pattern"][:length]
             if prefix not in existing and not covered(prefix, prefixes):
                 groups.setdefault(tuple(prefix), []).append(row)
     return groups
 
 
-# Enter allows, as before; unknown answers ask again.
+def proposals(source):
+    return group(allowed_rules(source), 2, source)
+
+
+# Enter allows; [v]iew, [l]onger and unknown answers ask again.
 DECISIONS = {"": "allow", "a": "allow", "allow": "allow",
              "p": "prompt", "prompt": "prompt",
              "d": "forbidden", "deny": "forbidden",
              "s": None, "skip": None}
 
 
+def shell_command(pattern):
+    """Render a pattern as a readable one-line shell command."""
+    return " ".join(shlex.quote(arg) if arg.isprintable()
+                    else "$" + shlex.quote(arg.encode("unicode_escape").decode("ascii"))
+                    for arg in pattern)
+
+
 def simplify(source, ask=input):
     selected = []
-    for prefix in proposals(source):
+    pending = list(proposals(source).items())
+    while pending:
+        prefix, rows = pending.pop(0)
         command = json.dumps(" ".join(prefix) + " ...", ensure_ascii=True)
         while True:
-            answer = ask(f"Prefix {command}? [A]llow [p]rompt [d]eny [s]kip ").strip().lower()
+            answer = ask(
+                f"Prefix {command}? [A]llow [p]rompt [d]eny [s]kip [v]iew [l]onger "
+            ).strip().lower()
             if answer in DECISIONS:
                 break
-        if DECISIONS[answer]:
+            if answer in {"v", "view"}:
+                for row in rows:
+                    print("  " + shell_command(row["pattern"]))
+            elif answer in {"l", "longer"}:
+                longer = list(group(rows, len(prefix) + 1, source).items())
+                if longer:
+                    break
+                print("  No longer prefix to propose.")
+        if answer in {"l", "longer"}:
+            # Replace this proposal with one per longer prefix, asked next.
+            pending[:0] = longer
+        elif DECISIONS[answer]:
             selected.append((prefix, DECISIONS[answer]))
 
     count = 0

@@ -24,10 +24,13 @@ Requires Python 3.9+ and uses the standard library only.
 The rules file path is required.
 
 The tool displays one single-line prompt for each proposal, such as
-`Prefix "git add ..."? [A]llow [p]rompt [d]eny [s]kip` (the capital letter
-marks the default). Answer `a` (or Enter) to add the prefix with
+`Prefix "git add ..."? [A]llow [p]rompt [d]eny [s]kip [v]iew [l]onger` (the
+capital letter marks the default). Answer `a` (or Enter) to add the prefix with
 `decision="allow"`, `p` for `decision="prompt"` (always ask), `d` for
-`decision="forbidden"`, or `s` to skip it; other answers repeat the question.
+`decision="forbidden"`, or `s` to skip it. `v` shows the rules that the prefix
+would shorten, as shell commands, and asks again. `l` replaces the proposal
+with longer prefixes (one more element each), for example `python3 -m ...` →
+`python3 -m py_compile ...`; other answers repeat the question.
 Prompt and deny rules do not make longer allow rules redundant, and prefixes
 that already have a rule are not proposed again. Then `Add N rule(s)? [y/N]`
 confirms adding the selected rules (Enter declines).

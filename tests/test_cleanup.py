@@ -66,11 +66,11 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(result, (source, 0))
         self.assertEqual(output.getvalue(), "")
         self.assertEqual(len(prompts), 2)
-        self.assertEqual(prompts[0], 'Prefix "git add ..."? [A]llow [p]rompt [d]eny [s]kip ')
+        self.assertEqual(prompts[0], 'Prefix "git add ..."? [A]llow [p]rompt [d]eny [s]kip [v]iew [l]onger ')
         for prompt in prompts:
             self.assertEqual(len(prompt.splitlines()), 1)
             self.assertTrue(prompt.startswith('Prefix "git '))
-            self.assertTrue(prompt.endswith(' ..."? [A]llow [p]rompt [d]eny [s]kip '))
+            self.assertTrue(prompt.endswith(' ..."? [A]llow [p]rompt [d]eny [s]kip [v]iew [l]onger '))
 
     def test_enter_accepts_proposal(self):
         source = 'prefix_rule(pattern=["git", "add", "a"], decision="allow")\n'
@@ -110,7 +110,7 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertEqual(result.count("prefix_rule"), 2)
         self.assertEqual(prompts, [
-            'Prefix "git add ..."? [A]llow [p]rompt [d]eny [s]kip ',
+            'Prefix "git add ..."? [A]llow [p]rompt [d]eny [s]kip [v]iew [l]onger ',
             'Add 1 rule(s)? [y/N] ',
             'Remove 1 rule(s) covered by shorter prefixes? [y/N] ',
         ])
@@ -150,6 +150,74 @@ class CleanupTests(unittest.TestCase):
         self.assertIn('prefix_rule(pattern=["rm", "-rf"], decision="forbidden")', result)
         self.assertEqual(prompts[0], prompts[1])
         self.assertEqual(cleanup.proposals(result), {})
+
+    def test_view_shows_rules_behind_proposal_and_asks_again(self):
+        source = ('# header\n'
+                  'prefix_rule(pattern=["git", "add", "a"], decision="allow")\n'
+                  'prefix_rule(pattern=["git", "status"], decision="allow")\n'
+                  'prefix_rule(\n pattern=["git", "add", "b"],\n decision="allow")\n')
+        prompts = []
+        answers = iter(["v", "s"])
+        output = io.StringIO()
+
+        def ask(prompt):
+            prompts.append(prompt)
+            return next(answers)
+
+        with contextlib.redirect_stdout(output):
+            result = cleanup.simplify(source, ask)
+        self.assertEqual(result, (source, 0))
+        self.assertEqual(prompts[0], prompts[1])
+        self.assertEqual(output.getvalue(),
+                         '  git add a\n'
+                         '  git add b\n')
+
+    def test_shell_command_is_readable_and_single_line(self):
+        self.assertEqual(cleanup.shell_command(["git", "commit", "-m", "fix bug"]),
+                         "git commit -m 'fix bug'")
+        self.assertEqual(cleanup.shell_command(["printf", "a\nb"]), "printf $'a\\nb'")
+
+    def test_longer_splits_proposal_into_longer_prefixes(self):
+        source = ('prefix_rule(pattern=["python3", "-m", "unittest"], decision="allow")\n'
+                  'prefix_rule(pattern=["python3", "-m", "py_compile", "a.py"], decision="allow")\n'
+                  'prefix_rule(pattern=["python3", "-m", "py_compile", "b.py"], decision="allow")\n'
+                  'prefix_rule(pattern=["python3", "-m", "http.server", "8000"], decision="allow")\n')
+        prompts = []
+        answers = iter(["l", "a", "s", "y", "y"])
+
+        def ask(prompt):
+            prompts.append(prompt)
+            return next(answers)
+
+        result, count = cleanup.simplify(source, ask)
+        self.assertEqual([prompt.split("?")[0] for prompt in prompts[:3]], [
+            'Prefix "python3 -m ..."',
+            'Prefix "python3 -m py_compile ..."',
+            'Prefix "python3 -m http.server ..."',
+        ])
+        self.assertEqual(count, 3)
+        self.assertIn('prefix_rule(pattern=["python3", "-m", "py_compile"], decision="allow")',
+                      result)
+        self.assertNotIn('"a.py"', result)
+        self.assertNotIn('"b.py"', result)
+        self.assertIn('pattern=["python3", "-m", "unittest"]', result)
+        self.assertIn('"http.server", "8000"', result)
+        self.assertNotIn('pattern=["python3", "-m"]', result)
+
+    def test_longer_without_longer_prefix_asks_again(self):
+        source = 'prefix_rule(pattern=["git", "add", "a"], decision="allow")\n'
+        prompts = []
+        answers = iter(["l", "s"])
+        output = io.StringIO()
+
+        def ask(prompt):
+            prompts.append(prompt)
+            return next(answers)
+
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(cleanup.simplify(source, ask), (source, 0))
+        self.assertEqual(prompts[0], prompts[1])
+        self.assertEqual(output.getvalue(), "  No longer prefix to propose.\n")
 
     def test_backup_and_concurrent_change(self):
         with tempfile.TemporaryDirectory() as directory:
