@@ -664,16 +664,17 @@ def fetch_agy():
 # Parallel data collection
 # ------------------------------------------------------------
 
+# Display order: alphabetical.
 FETCHERS = {
-    "codex": fetch_codex,
-    "claude": fetch_claude,
     "agy": fetch_agy,
+    "claude": fetch_claude,
+    "codex": fetch_codex,
 }
 
 NAMES = {
-    "codex": "Codex",
-    "claude": "Claude",
     "agy": "Antigravity",
+    "claude": "Claude",
+    "codex": "Codex",
 }
 
 
@@ -854,26 +855,28 @@ def render_window(
     )
 
 
+# Placeholder for a horizontal rule; render_screen replaces it
+# once the width of the widest content line is known.
+DIVIDER = "\0divider"
+
+ANSI_ESCAPE = re.compile(r"\033\[[0-9;]*m")
+
+
+def visible_width(text):
+    """Width on screen, ignoring color codes."""
+    return len(ANSI_ESCAPE.sub("", text))
+
+
 def render_provider(
     provider,
     result,
     label_width,
     bar_width,
-    width,
     colors,
 ):
     lines = []
 
-    divider = "─" * width
-
-    lines.append("")
-    lines.append(
-        paint(
-            divider,
-            "dim",
-            colors,
-        )
-    )
+    lines.append(DIVIDER)
 
     header = paint(
         f"  {result.name}",
@@ -918,13 +921,7 @@ def render_provider(
 
     lines.append(header)
 
-    lines.append(
-        paint(
-            divider,
-            "dim",
-            colors,
-        )
-    )
+    lines.append(DIVIDER)
 
     if result.error:
         lines.append(
@@ -1028,28 +1025,67 @@ def render_screen(results, interval):
     lines = []
 
     for provider, result in results.items():
+        # A blank line between providers, none above the first.
+        if lines:
+            lines.append("")
+
         lines.extend(
             render_provider(
                 provider,
                 result,
                 label_width,
                 bar_width,
-                width,
                 colors,
             )
         )
 
     lines.append("")
+    lines.append(DIVIDER)
+
+    # Rules one cell wider than the widest content line, for
+    # symmetry with the indent, never wider than the terminal.
+    divider_width = min(
+        width,
+        1
+        + max(
+            (
+                visible_width(line)
+                for line in lines
+                if line != DIVIDER
+            ),
+            default=width,
+        ),
+    )
+
+    divider = paint(
+        "─" * divider_width,
+        "dim",
+        colors,
+    )
+
+    lines = [
+        divider if line == DIVIDER else line
+        for line in lines
+    ]
+
+    # Footer aligned to the right end of the rules.
+    footer = (
+        f"Refreshing every {interval:g} seconds"
+        " · Ctrl+C to exit"
+    )
+
     lines.append(
         paint(
-            f"Refreshing every {interval:g} seconds"
-            " · Ctrl+C to exit",
+            footer.rjust(divider_width),
             "dim",
             colors,
         )
     )
 
-    return "\n".join(lines) + "\n"
+    # End with "\r" rather than "\n": the cursor waits at the
+    # start of the footer line instead of on an empty line
+    # below it.
+    return "\n".join(lines) + "\r"
 
 
 # ------------------------------------------------------------
@@ -1117,10 +1153,15 @@ def main():
                 )
 
             sys.stdout.write(screen)
-            sys.stdout.flush()
 
             if args.once:
+                # Move below the footer so the shell prompt does
+                # not overwrite it.
+                sys.stdout.write("\n")
+                sys.stdout.flush()
                 break
+
+            sys.stdout.flush()
 
             now = time.monotonic()
 
