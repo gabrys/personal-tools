@@ -1,16 +1,5 @@
 # personal-tools
 
-## sucker
-
-`sucker ps` and `sucker compose ...` start a persistent broker in a detached
-tmux session automatically. Enter the Docker PIN (the `sucker` account password)
-once in Zenity; approve each command in a separate dialog.
-Docker runs as the `sucker` user. The tool uses Python's standard library only.
-To install, run `./sucker broker setup`, then link `~/.local/bin/sucker` to the
-script in this repository.
-`sucker askpass` opens the masked Docker PIN prompt and writes the entered PIN
-to stdout for programs that use the askpass protocol.
-
 ## prefix-cleanup
 
 Interactively shorten allowed Codex prefixes to two elements (a command and one

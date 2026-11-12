@@ -19,6 +19,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -34,6 +35,7 @@ from zoneinfo import ZoneInfo
 # ------------------------------------------------------------
 
 REFRESH_INTERVAL = 30
+TERMINAL_TITLE = "AI usage"
 CODEX_TIMEOUT = 20
 CLAUDE_TIMEOUT = 60
 AGY_TIMEOUT = 60
@@ -677,6 +679,19 @@ NAMES = {
     "codex": "Codex",
 }
 
+# Short agent names for the one-line summary.
+AGENT_SHORT_NAMES = {
+    "agy-gemini": "gem",
+    "agy-claude-gpt": "agx",
+    "agy-argon": "arg",
+    "claude": "cd",
+    "codex": "cx",
+}
+
+# Summary line: this many agents furthest above target,
+# then "|", then this many furthest below.
+SUMMARY_EXTREMES = 2
+
 
 def collect(only=None):
     """
@@ -803,6 +818,7 @@ def render_window(
     provider,
     label_width,
     bar_width,
+    detail,
     colors,
 ):
     label = f"  {item.label:<{label_width}}"
@@ -819,10 +835,13 @@ def render_window(
 
     reset = format_time(item.reset)
 
+    # Narrow terminals: values only, no "used" / "resets".
+    prefix = "resets " if detail else ""
+
     if reset:
-        reset_text = f"resets {reset}"
+        reset_text = prefix + reset
     elif item.reset_text:
-        reset_text = f"resets {item.reset_text}"
+        reset_text = prefix + item.reset_text
     elif percentage == 0:
         reset_text = "not started"
     else:
@@ -838,7 +857,11 @@ def render_window(
         colors,
     )
 
-    used_text = f"{percentage:3d}% used"
+    used_text = (
+        f"{percentage:3d}% used"
+        if detail
+        else f"{percentage:3d}%"
+    )
 
     if expected is not None and used > expected:
         # Ahead of schedule: flag the number as well.
@@ -858,6 +881,14 @@ def render_window(
 # Placeholder for a horizontal rule; render_screen replaces it
 # once the width of the widest content line is known.
 DIVIDER = "\0divider"
+HEADER = "\0header"
+# Compact provider header: a rule with the name in it. The
+# painted name follows the marker; render_screen fills in the
+# rule once the width is known.
+RULE = "\0rule"
+
+# Minimum spaces between "AI usage" and the header's right part.
+HEADER_GAP = 5
 
 ANSI_ESCAPE = re.compile(r"\033\[[0-9;]*m")
 
@@ -872,14 +903,17 @@ def render_provider(
     result,
     label_width,
     bar_width,
+    detail,
+    compact,
     colors,
 ):
     lines = []
 
-    lines.append(DIVIDER)
+    if not compact:
+        lines.append(DIVIDER)
 
     header = paint(
-        f"  {result.name}",
+        result.name if compact else f"  {result.name}",
         provider,
         colors,
     )
@@ -919,9 +953,11 @@ def render_provider(
             colors,
         )
 
-    lines.append(header)
-
-    lines.append(DIVIDER)
+    if compact:
+        lines.append(RULE + header)
+    else:
+        lines.append(header)
+        lines.append(DIVIDER)
 
     if result.error:
         lines.append(
@@ -960,7 +996,7 @@ def render_provider(
 
     for index, group in enumerate(result.groups):
         if show_group_names:
-            if index:
+            if index and not compact:
                 lines.append("")
 
             lines.append(
@@ -978,6 +1014,7 @@ def render_provider(
                     provider,
                     label_width,
                     bar_width,
+                    detail,
                     colors,
                 )
             )
@@ -985,18 +1022,31 @@ def render_provider(
     return lines
 
 
-def render_screen(results, interval):
+def render_screen(results, interval, compact=None):
     """
     Pure rendering.
 
     No subprocesses, threads, or network requests.
+
+    `compact` drops the header line and blank lines between
+    groups, folds each provider header into a single rule
+    and leaves out the closing rule. When
+    None, the full layout is used if it fits the terminal
+    height, the compact one otherwise.
     """
-    width = min(
-        100,
-        shutil.get_terminal_size(
-            (100, 20)
-        ).columns,
-    )
+    size = shutil.get_terminal_size((100, 20))
+    width = min(100, size.columns)
+
+    if compact is None:
+        full = render_screen(results, interval, False)
+
+        # The screen ends with a newline, so the cursor needs
+        # one more row; otherwise the terminal scrolls by one
+        # line and the header is lost.
+        if full.count("\n") < size.lines:
+            return full
+
+        return render_screen(results, interval, True)
 
     colors = (
         sys.stdout.isatty()
@@ -1016,17 +1066,29 @@ def render_screen(results, interval):
     )
 
     # Same bar width on every line: leave room for the label,
-    # brackets, percentage and "resets YYYY-MM-DD HH:MM".
+    # brackets, "NNN% used" and "resets YYYY-MM-DD HH:MM".
+    # When even a minimal bar does not fit, drop the words
+    # "used" and "resets" (detail 0) and give the bar the
+    # room they free up.
+    MIN_BAR = 10
+    detail = 0
+
+    for level, reserved in ((1, 45), (0, 33)):
+        if width - label_width - reserved >= MIN_BAR:
+            detail = level
+            break
+
     bar_width = max(
-        10,
-        min(36, width - label_width - 45),
+        MIN_BAR,
+        min(36, width - label_width - reserved),
     )
 
-    lines = []
+    # The compact layout has no "AI usage" header line.
+    lines = [] if compact else [HEADER]
 
     for provider, result in results.items():
         # A blank line between providers, none above the first.
-        if lines:
+        if lines and lines[-1] != HEADER:
             lines.append("")
 
         lines.extend(
@@ -1035,12 +1097,15 @@ def render_screen(results, interval):
                 result,
                 label_width,
                 bar_width,
+                detail,
+                compact,
                 colors,
             )
         )
 
-    lines.append("")
-    lines.append(DIVIDER)
+    if not compact:
+        lines.append("")
+        lines.append(DIVIDER)
 
     # Rules one cell wider than the widest content line, for
     # symmetry with the indent, never wider than the terminal.
@@ -1051,7 +1116,8 @@ def render_screen(results, interval):
             (
                 visible_width(line)
                 for line in lines
-                if line != DIVIDER
+                if line not in (DIVIDER, HEADER)
+                and not line.startswith(RULE)
             ),
             default=width,
         ),
@@ -1063,29 +1129,218 @@ def render_screen(results, interval):
         colors,
     )
 
+    # Header spread over the same width as the rules: title
+    # at the left edge, refresh info at the right edge.
+    title = "AI usage"
+    refresh = f"refreshing every {interval:g} seconds"
+    exit_hint = "Ctrl+C to exit"
+
+    # Drop the refresh note, then the exit hint, unless at
+    # least HEADER_GAP cells separate them from the title.
+    for info in (
+        f"{refresh} · {exit_hint}",
+        exit_hint,
+        "",
+    ):
+        gap = divider_width - len(title) - len(info)
+
+        if gap >= HEADER_GAP or not info:
+            break
+
+    gap = max(0, gap)
+
+    header = (
+        paint(title, "bold", colors)
+        + " " * gap
+        + paint(info, "dim", colors)
+    )
+
+    def rule_with(name):
+        # "── Name ─────": the name keeps its own color.
+        name = name[len(RULE):]
+        rest = divider_width - visible_width(name) - 4
+
+        return (
+            paint("── ", "dim", colors)
+            + name
+            + paint(" " + "─" * max(0, rest), "dim", colors)
+        )
+
     lines = [
-        divider if line == DIVIDER else line
+        divider if line == DIVIDER
+        else header if line == HEADER
+        else rule_with(line) if line.startswith(RULE)
+        else line
         for line in lines
     ]
 
-    # Footer aligned to the right end of the rules.
-    footer = (
-        f"Refreshing every {interval:g} seconds"
-        " · Ctrl+C to exit"
-    )
+    return "\n".join(lines) + "\n"
 
-    lines.append(
-        paint(
-            footer.rjust(divider_width),
-            "dim",
-            colors,
-        )
-    )
 
-    # End with "\r" rather than "\n": the cursor waits at the
-    # start of the footer line instead of on an empty line
-    # below it.
-    return "\n".join(lines) + "\r"
+# ------------------------------------------------------------
+# Agents: one score per model family
+# ------------------------------------------------------------
+
+# (agent, provider, group name). A None group means the
+# provider's only group. Groups not listed (e.g. Claude's
+# per-model weekly limit) are ignored here.
+AGENTS = [
+    ("agy-gemini", "agy", "gemini models"),
+    ("agy-claude-gpt", "agy", "claude and gpt models"),
+    ("agy-argon", "agy", "gemini 4 argon"),
+    ("claude", "claude", "all models"),
+    ("codex", "codex", None),
+]
+
+
+def agent_scores(results, now=None):
+    """
+    How far each agent is ahead of its usage target.
+
+    For every window of the agent's group the target is the
+    elapsed share of the window; the score is `used - target`
+    in percentage points, and the agent's score is the larger
+    of its 5h and 7d scores. Positive: using faster than time
+    passes. Windows that have not started yet are skipped.
+    None: no data (provider error, unknown reset).
+    """
+    now = now or now_local()
+    scores = {}
+
+    for agent, provider, group_name in AGENTS:
+        result = results.get(provider)
+        score = None
+
+        if result is not None and not result.error:
+            for group in result.groups:
+                if (
+                    group_name is not None
+                    and group.name.lower() != group_name
+                ):
+                    continue
+
+                for item in group.windows:
+                    expected = item.expected(now)
+
+                    if item.used is None or expected is None:
+                        continue
+
+                    if item.used == 0:
+                        # Window not started yet (e.g. an idle
+                        # 5h session): nothing to judge, let the
+                        # other window decide.
+                        continue
+
+                    delta = float(item.used) - expected
+
+                    if score is None or delta > score:
+                        score = delta
+
+        scores[agent] = score
+
+    return scores
+
+
+# ------------------------------------------------------------
+# One-line summary (window title)
+# ------------------------------------------------------------
+
+def short_reset(value, now):
+    if value is None:
+        return "?"
+
+    value = value.astimezone()
+
+    if value.date() == now.date():
+        return value.strftime("%H:%M")
+
+    return value.strftime("%d.%m")
+
+
+def exhausted_resets(results, now):
+    """
+    Agent -> reset time text of its used-up window, if any.
+    """
+    resets = {}
+
+    for agent, provider, group_name in AGENTS:
+        result = results.get(provider)
+
+        if result is None or result.error:
+            continue
+
+        for group in result.groups:
+            if (
+                group_name is not None
+                and group.name.lower() != group_name
+            ):
+                continue
+
+            for item in group.windows:
+                if item.used is not None and item.used >= 99:
+                    resets[agent] = short_reset(
+                        item.reset, now
+                    )
+                    break
+
+            if agent in resets:
+                break
+
+    return resets
+
+
+def summary_line(results):
+    """
+    The agents furthest above and furthest below target.
+
+    Example: "gem ↓8 cx ↓5 | arg ↑29 agx ×18:41"
+
+    Entries run from best to worst; "|" separates the
+    SUMMARY_EXTREMES best from the SUMMARY_EXTREMES worst.
+    A used-up agent shows its reset time instead of a number.
+    """
+    now = now_local()
+    scores = agent_scores(results, now)
+    resets = exhausted_resets(results, now)
+
+    entries = []
+
+    for agent, score in scores.items():
+        short = AGENT_SHORT_NAMES.get(agent, agent)
+
+        if agent in resets:
+            # Nothing left to use: worst of all.
+            entries.append(
+                (float("inf"), f"{short} ×{resets[agent]}")
+            )
+        elif score is not None:
+            arrow = "↑" if score > 0 else "↓"
+
+            entries.append(
+                (score, f"{short} {arrow}{abs(score):.0f}")
+            )
+
+    if not entries:
+        return TERMINAL_TITLE
+
+    entries.sort(key=lambda entry: -entry[0])
+
+    worst = entries[:SUMMARY_EXTREMES]
+    best = entries[SUMMARY_EXTREMES:][-SUMMARY_EXTREMES:]
+
+    parts = [text for _, text in worst]
+
+    if best:
+        parts.append("|")
+        parts.extend(text for _, text in best)
+
+    return " ".join(reversed(parts))
+
+
+def set_title(text):
+    if sys.stdout.isatty():
+        # OSC 0: set the terminal window title.
+        sys.stdout.write(f"\033]0;{text}\007")
 
 
 # ------------------------------------------------------------
@@ -1123,7 +1378,34 @@ def main():
             "--interval must be positive"
         )
 
+    tty = sys.stdout.isatty()
+
+    def draw(results):
+        if tty:
+            sys.stdout.write("\033[H\033[2J")
+
+        sys.stdout.write(
+            render_screen(results, args.interval)
+        )
+
+    # Last results, redrawn when the terminal is resized.
+    latest = {"results": None}
+
+    def on_resize(signum, frame):
+        if latest["results"] is not None:
+            draw(latest["results"])
+            sys.stdout.flush()
+
+    if tty and hasattr(signal, "SIGWINCH"):
+        signal.signal(signal.SIGWINCH, on_resize)
+
     try:
+        set_title(TERMINAL_TITLE)
+
+        if tty:
+            # Hide the cursor; restored in the finally block.
+            sys.stdout.write("\033[?25l")
+
         sys.stdout.write(
             "Collecting AI usage\n"
         )
@@ -1140,28 +1422,15 @@ def main():
             # 1. Fetch all providers in parallel.
             results = collect(args.only)
 
-            # 2. Render only after all fetches finish.
-            screen = render_screen(
-                results,
-                args.interval,
-            )
-
-            # 3. Replace the entire terminal view.
-            if sys.stdout.isatty():
-                sys.stdout.write(
-                    "\033[H\033[2J"
-                )
-
-            sys.stdout.write(screen)
+            # 2. Render only after all fetches finish, and
+            #    replace the entire terminal view.
+            latest["results"] = results
+            draw(results)
+            set_title(summary_line(results))
+            sys.stdout.flush()
 
             if args.once:
-                # Move below the footer so the shell prompt does
-                # not overwrite it.
-                sys.stdout.write("\n")
-                sys.stdout.flush()
                 break
-
-            sys.stdout.flush()
 
             now = time.monotonic()
 
@@ -1173,6 +1442,11 @@ def main():
 
     except KeyboardInterrupt:
         print("\nStopped.")
+
+    finally:
+        if tty:
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
 
 
 if __name__ == "__main__":
