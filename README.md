@@ -1,5 +1,38 @@
 # personal-tools
 
+## ai_usage.py
+
+Terminal dashboard of the usage limits of Codex, Claude Code and Antigravity.
+Requires Python 3.9+ and uses the standard library only; the data comes from
+`codex app-server`, `claude -p /usage` and `agy -p /usage`, so all three CLIs
+must be installed and logged in.
+
+![ai_usage.py in a terminal](docs/ai_usage.png)
+
+```bash
+./ai_usage.py                 # refresh every 30 seconds
+./ai_usage.py --once          # print once and exit
+./ai_usage.py --only codex    # one provider: codex, claude or agy
+./ai_usage.py --interval 60
+```
+
+Each bar shows the usage of a 5-hour or weekly window. The grey part is split
+where the window currently is in time: the darker shade is time that has
+already passed, the lighter shade is time left. Usage beyond that point, and
+its percentage, is red: the limit is being used faster than time passes.
+When a window is used up, its reset time appears in red next to the provider
+name.
+
+The terminal title summarises five agents (`gem`, `agx` and `arg` for the
+Antigravity groups, `cd` for Claude, `cx` for Codex) by how far they are from
+using the limit at the same pace as the window, in percentage points: the two
+with the most headroom (`↓`), then `|`, then the two furthest ahead of
+schedule (`↑`). An agent whose window is used up shows its reset time instead.
+
+The layout adapts to the terminal: the words `used` and `resets` disappear
+when columns run out, the header and blank lines disappear when rows run out,
+and the screen is redrawn on resize.
+
 ## prefix-cleanup
 
 Interactively shorten allowed Codex prefixes to two elements (a command and one
