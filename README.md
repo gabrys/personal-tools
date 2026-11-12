@@ -26,8 +26,9 @@ name.
 The terminal title summarises five agents (`gem`, `agx` and `arg` for the
 Antigravity groups, `cd` for Claude, `cx` for Codex) by how far they are from
 using the limit at the same pace as the window, in percentage points: the two
-with the most headroom (`↓`), then `|`, then the two furthest ahead of
-schedule (`↑`). An agent whose window is used up shows its reset time instead.
+with the most headroom (`↓`, best first), then `|`, then the two furthest
+ahead of schedule (`↑`, worst first), so the extremes sit next to the bar. An
+agent whose window is used up shows its reset time instead.
 
 The layout adapts to the terminal: the words `used` and `resets` disappear
 when columns run out, the header and blank lines disappear when rows run out,

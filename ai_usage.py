@@ -1293,10 +1293,12 @@ def summary_line(results):
     """
     The agents furthest above and furthest below target.
 
-    Example: "gem ↓8 cx ↓5 | arg ↑29 agx ×18:41"
+    Example: "gem ↓8 cx ↓5 | agx ×18:41 arg ↑29"
 
-    Entries run from best to worst; "|" separates the
-    SUMMARY_EXTREMES best from the SUMMARY_EXTREMES worst.
+    Left of "|": the SUMMARY_EXTREMES agents with the most
+    headroom, best first. Right of it: the SUMMARY_EXTREMES
+    furthest ahead of schedule, worst first. The extremes sit
+    next to the bar; the last entry matters least.
     A used-up agent shows its reset time instead of a number.
     """
     now = now_local()
@@ -1325,16 +1327,18 @@ def summary_line(results):
 
     entries.sort(key=lambda entry: -entry[0])
 
+    # `entries` is sorted worst to best.
     worst = entries[:SUMMARY_EXTREMES]
     best = entries[SUMMARY_EXTREMES:][-SUMMARY_EXTREMES:]
 
-    parts = [text for _, text in worst]
+    parts = [text for _, text in reversed(best)]
 
-    if best:
+    if parts:
         parts.append("|")
-        parts.extend(text for _, text in best)
 
-    return " ".join(reversed(parts))
+    parts.extend(text for _, text in worst)
+
+    return " ".join(parts)
 
 
 def set_title(text):
