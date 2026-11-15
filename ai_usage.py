@@ -1305,7 +1305,7 @@ def summary_line(results):
     """
     Summary for the terminal window title.
 
-    Example: "🔵 cld 🟢 cdx ⛔ agx 18:41 🟠 arg"
+    Example: "🔵\u2009cld    🟢\u2009cdx    ⛔\u2009agx 18:41    🟠\u2009arg"
 
     Displays 4 items without numbers:
     Pos 1: Best agent
@@ -1333,7 +1333,7 @@ def summary_line(results):
         if agent in resets:
             # Exhausted: worst of all.
             entries.append(
-                (float("inf"), f"⛔ {short} {resets[agent]}")
+                (float("inf"), f"⛔\u2009{short} {resets[agent]}")
             )
         elif score is not None:
             if score < -15:
@@ -1348,7 +1348,7 @@ def summary_line(results):
                 emoji = "🔴"
 
             entries.append(
-                (score, f"{emoji} {short}")
+                (score, f"{emoji}\u2009{short}")
             )
 
     if not entries:
@@ -1366,7 +1366,7 @@ def summary_line(results):
 
     parts = [text for _, text in best] + [text for _, text in worst]
 
-    return " ".join(parts)
+    return "    ".join(parts)
 
 
 def set_title(text):

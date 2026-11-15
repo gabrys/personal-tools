@@ -37,7 +37,9 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(scores['agy-gemini'], 0)
         self.assertEqual(scores['agy-argon'], 0)
         with patch.object(usage, 'now_local', return_value=now):
-            summary = usage.summary_line(results).split()
+            raw_summary = usage.summary_line(results)
+        self.assertEqual(len(raw_summary.split('    ')), 4)
+        summary = raw_summary.split()
         self.assertEqual(summary[1::2], ['cdx', 'cld', 'agx', 'arg'])
 
     def test_unstarted_session_does_not_hide_weekly_headroom(self):
