@@ -41,6 +41,7 @@ CLAUDE_TIMEOUT = 60
 AGY_TIMEOUT = 60
 
 FIVE_HOURS = dt.timedelta(hours=5)
+SIX_HOURS = dt.timedelta(hours=6)
 ONE_WEEK = dt.timedelta(days=7)
 
 ANSI = {
@@ -77,9 +78,17 @@ class UsageWindow:
         if self.reset is None or not self.duration:
             return None
 
+        # Temporary: treat 5h windows as 6h windows starting
+        # 6 hours before the scheduled reset time.
+        duration = (
+            SIX_HOURS
+            if self.duration == FIVE_HOURS
+            else self.duration
+        )
+
         remaining = (
             self.reset - now
-        ) / self.duration
+        ) / duration
 
         return 100 * max(
             0.0, min(1.0, 1 - remaining)
@@ -684,8 +693,8 @@ AGENT_SHORT_NAMES = {
     "agy-gemini": "gem",
     "agy-claude-gpt": "agx",
     "agy-argon": "arg",
-    "claude": "cd",
-    "codex": "cx",
+    "claude": "cld",
+    "codex": "cdx",
 }
 
 # Summary line: this many agents furthest above target,
@@ -1225,10 +1234,11 @@ def agent_scores(results, now=None):
                     if item.used is None or expected is None:
                         continue
 
-                    if item.used == 0:
+                    if item.used == 0 and item.duration == FIVE_HOURS:
                         # Window not started yet (e.g. an idle
                         # 5h session): nothing to judge, let the
-                        # other window decide.
+                        # weekly window decide. Zero weekly usage
+                        # still counts as available headroom.
                         continue
 
                     delta = float(item.used) - expected
@@ -1291,15 +1301,23 @@ def exhausted_resets(results, now):
 
 def summary_line(results):
     """
-    The agents furthest above and furthest below target.
+    Summary for the terminal window title.
 
-    Example: "gem ↓8 cx ↓5 | agx ×18:41 arg ↑29"
+    Example: "🔵 cld 🟢 cdx ⛔ agx 18:41 🟠 arg"
 
-    Left of "|": the SUMMARY_EXTREMES agents with the most
-    headroom, best first. Right of it: the SUMMARY_EXTREMES
-    furthest ahead of schedule, worst first. The extremes sit
-    next to the bar; the last entry matters least.
-    A used-up agent shows its reset time instead of a number.
+    Displays 4 items without numbers:
+    Pos 1: Best agent
+    Pos 2: 2nd best agent
+    Pos 3: Worst agent (exhausted shows reset time)
+    Pos 4: 2nd worst agent
+
+    Circles by deviation (used% - elapsed%):
+      🔵  < -15
+      🟢  -15 to -3
+      🟡  -3 to +3
+      🟠  +3 to +20
+      🔴  > +20
+      ⛔  exhausted / used up (>= 99%)
     """
     now = now_local()
     scores = agent_scores(results, now)
@@ -1311,32 +1329,40 @@ def summary_line(results):
         short = AGENT_SHORT_NAMES.get(agent, agent)
 
         if agent in resets:
-            # Nothing left to use: worst of all.
+            # Exhausted: worst of all.
             entries.append(
-                (float("inf"), f"{short} ×{resets[agent]}")
+                (float("inf"), f"⛔ {short} {resets[agent]}")
             )
         elif score is not None:
-            arrow = "↑" if score > 0 else "↓"
+            if score < -15:
+                emoji = "🔵"
+            elif score <= -3:
+                emoji = "🟢"
+            elif score <= 3:
+                emoji = "🟡"
+            elif score <= 20:
+                emoji = "🟠"
+            else:
+                emoji = "🔴"
 
             entries.append(
-                (score, f"{short} {arrow}{abs(score):.0f}")
+                (score, f"{emoji} {short}")
             )
 
     if not entries:
         return TERMINAL_TITLE
 
-    entries.sort(key=lambda entry: -entry[0])
+    # Sort best (lowest score) to worst (highest score / inf)
+    entries.sort(key=lambda entry: entry[0])
 
-    # `entries` is sorted worst to best.
-    worst = entries[:SUMMARY_EXTREMES]
-    best = entries[SUMMARY_EXTREMES:][-SUMMARY_EXTREMES:]
+    if len(entries) <= 4:
+        best = entries[:2]
+        worst = sorted(entries[2:], key=lambda entry: -entry[0])
+    else:
+        best = entries[:SUMMARY_EXTREMES]
+        worst = sorted(entries[-SUMMARY_EXTREMES:], key=lambda entry: -entry[0])
 
-    parts = [text for _, text in reversed(best)]
-
-    if parts:
-        parts.append("|")
-
-    parts.extend(text for _, text in worst)
+    parts = [text for _, text in best] + [text for _, text in worst]
 
     return " ".join(parts)
 
