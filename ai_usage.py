@@ -42,6 +42,7 @@ AGY_TIMEOUT = 60
 
 FIVE_HOURS = dt.timedelta(hours=5)
 SIX_HOURS = dt.timedelta(hours=6)
+FIVE_HOUR_SHIFT = dt.timedelta(minutes=15)
 ONE_WEEK = dt.timedelta(days=7)
 
 ANSI = {
@@ -78,16 +79,17 @@ class UsageWindow:
         if self.reset is None or not self.duration:
             return None
 
-        # Temporary: treat 5h windows as 6h windows starting
-        # 6 hours before the scheduled reset time.
-        duration = (
-            SIX_HOURS
-            if self.duration == FIVE_HOURS
-            else self.duration
-        )
+        # Temporary: treat 5h windows as 6h windows shifted
+        # 15 minutes later (100% expected 15m after reset).
+        if self.duration == FIVE_HOURS:
+            duration = SIX_HOURS
+            end = self.reset + FIVE_HOUR_SHIFT
+        else:
+            duration = self.duration
+            end = self.reset
 
         remaining = (
-            self.reset - now
+            end - now
         ) / duration
 
         return 100 * max(
