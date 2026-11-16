@@ -7,6 +7,7 @@ Python 3.9+, standard library only.
 Usage:
     python3 ai_usage.py
     python3 ai_usage.py --once
+    python3 ai_usage.py --json
     python3 ai_usage.py --only codex
     python3 ai_usage.py --interval 60
 """
@@ -110,7 +111,6 @@ class ProviderResult:
     live: bool = True
     groups: list = field(default_factory=list)
     error: Optional[str] = None
-    updated_at: Optional[dt.datetime] = None
 
 
 # ------------------------------------------------------------
@@ -832,33 +832,28 @@ def render_window(
     detail,
     colors,
 ):
-    label = f"  {item.label:<{label_width}}"
+    label = f"  {item['label']:<{label_width}}"
 
-    if item.used is None:
+    used = item["used_percent"]
+
+    if used is None:
         return f"{label}  unavailable"
 
-    used = max(
-        0.0,
-        min(100.0, float(item.used))
-    )
-
-    percentage = int(used + 0.5)
-
-    reset = format_time(item.reset)
+    reset = format_time(parse_time(item["reset"]))
 
     # Narrow terminals: values only, no "used" / "resets".
     prefix = "resets " if detail else ""
 
     if reset:
         reset_text = prefix + reset
-    elif item.reset_text:
-        reset_text = prefix + item.reset_text
-    elif percentage == 0:
+    elif item["reset_text"]:
+        reset_text = prefix + item["reset_text"]
+    elif used == 0:
         reset_text = "not started"
     else:
         reset_text = "reset unavailable"
 
-    expected = item.expected(now_local())
+    expected = item["expected_percent"]
 
     bar = progress_bar(
         used,
@@ -869,9 +864,9 @@ def render_window(
     )
 
     used_text = (
-        f"{percentage:3d}% used"
+        f"{used:3d}% used"
         if detail
-        else f"{percentage:3d}%"
+        else f"{used:3d}%"
     )
 
     if expected is not None and used > expected:
@@ -923,8 +918,11 @@ def render_provider(
     if not compact:
         lines.append(DIVIDER)
 
+    name = result["name"]
+    groups = result["groups"]
+
     header = paint(
-        result.name if compact else f"  {result.name}",
+        name if compact else f"  {name}",
         provider,
         colors,
     )
@@ -933,14 +931,16 @@ def render_provider(
     # each of them resets, so it stands out.
     exhausted = []
 
-    for group in result.groups:
-        for item in group.windows:
-            if item.used is None or item.used < 99:
+    for group in groups:
+        for item in group["windows"]:
+            used = item["used_percent"]
+
+            if used is None or used < 99:
                 continue
 
             reset = (
-                format_time(item.reset)
-                or item.reset_text
+                format_time(parse_time(item["reset"]))
+                or item["reset_text"]
                 or "unknown"
             )
 
@@ -949,10 +949,10 @@ def render_provider(
             # "All models" adds nothing: the limit applies to
             # everything, so the bare reset time says it all.
             if (
-                len(result.groups) > 1
-                and group.name != "All models"
+                len(groups) > 1
+                and group["name"] != "All models"
             ):
-                text = f"{group.name} {text}"
+                text = f"{group['name']} {text}"
 
             if text not in exhausted:
                 exhausted.append(text)
@@ -970,55 +970,33 @@ def render_provider(
         lines.append(header)
         lines.append(DIVIDER)
 
-    if result.error:
+    if result["error"]:
         lines.append(
             paint(
                 f"  Unavailable: "
-                f"{result.error}",
+                f"{result['error']}",
                 "red",
                 colors,
             )
         )
         return lines
 
-    if result.updated_at:
-        updated = format_time(
-            result.updated_at
-        )
+    show_group_names = len(groups) > 1
 
-        age = max(
-            0,
-            (
-                now_local()
-                - result.updated_at
-            ).total_seconds(),
-        )
-
-        lines.append(
-            paint(
-                f"  Last update: {updated}"
-                f" ({int(age / 60)} min ago)",
-                "dim",
-                colors,
-            )
-        )
-
-    show_group_names = len(result.groups) > 1
-
-    for index, group in enumerate(result.groups):
+    for index, group in enumerate(groups):
         if show_group_names:
             if index and not compact:
                 lines.append("")
 
             lines.append(
                 paint(
-                    f"  {group.name.upper()}",
+                    f"  {group['name'].upper()}",
                     "bold",
                     colors,
                 )
             )
 
-        for item in group.windows:
+        for item in group["windows"]:
             lines.append(
                 render_window(
                     item,
@@ -1033,9 +1011,9 @@ def render_provider(
     return lines
 
 
-def render_screen(results, interval, compact=None):
+def render_screen(data, interval, compact=None):
     """
-    Pure rendering.
+    Pure rendering of the usage_data() dict.
 
     No subprocesses, threads, or network requests.
 
@@ -1049,7 +1027,7 @@ def render_screen(results, interval, compact=None):
     width = min(100, size.columns)
 
     if compact is None:
-        full = render_screen(results, interval, False)
+        full = render_screen(data, interval, False)
 
         # The screen ends with a newline, so the cursor needs
         # one more row; otherwise the terminal scrolls by one
@@ -1057,7 +1035,9 @@ def render_screen(results, interval, compact=None):
         if full.count("\n") < size.lines:
             return full
 
-        return render_screen(results, interval, True)
+        return render_screen(data, interval, True)
+
+    results = data["providers"]
 
     colors = (
         sys.stdout.isatty()
@@ -1068,10 +1048,10 @@ def render_screen(results, interval, compact=None):
 
     label_width = max(
         (
-            len(item.label)
+            len(item["label"])
             for result in results.values()
-            for group in result.groups
-            for item in group.windows
+            for group in result["groups"]
+            for item in group["windows"]
         ),
         default=0,
     )
@@ -1269,29 +1249,33 @@ def short_reset(value, now):
     return value.strftime("%d.%m")
 
 
-def exhausted_resets(results, now):
+def exhausted_resets(providers, now):
     """
     Agent -> reset time text of its used-up window, if any.
+
+    `providers` is the "providers" part of usage_data().
     """
     resets = {}
 
     for agent, provider, group_name in AGENTS:
-        result = results.get(provider)
+        result = providers.get(provider)
 
-        if result is None or result.error:
+        if result is None or result["error"]:
             continue
 
-        for group in result.groups:
+        for group in result["groups"]:
             if (
                 group_name is not None
-                and group.name.lower() != group_name
+                and group["name"].lower() != group_name
             ):
                 continue
 
-            for item in group.windows:
-                if item.used is not None and item.used >= 99:
+            for item in group["windows"]:
+                used = item["used_percent"]
+
+                if used is not None and used >= 99:
                     resets[agent] = short_reset(
-                        item.reset, now
+                        parse_time(item["reset"]), now
                     )
                     break
 
@@ -1301,9 +1285,10 @@ def exhausted_resets(results, now):
     return resets
 
 
-def summary_line(results):
+def summary_line(data):
     """
-    Summary for the terminal window title.
+    Summary of the usage_data() dict for the terminal
+    window title.
 
     Example: "🔵\u2009cld    🟢\u2009cdx    ⛔\u2009agx 18:41    🟠\u2009arg"
 
@@ -1322,8 +1307,8 @@ def summary_line(results):
       ⛔  exhausted / used up (>= 99%)
     """
     now = now_local()
-    scores = agent_scores(results, now)
-    resets = exhausted_resets(results, now)
+    scores = data["agents"]
+    resets = exhausted_resets(data["providers"], now)
 
     entries = []
 
@@ -1369,6 +1354,66 @@ def summary_line(results):
     return "    ".join(parts)
 
 
+# ------------------------------------------------------------
+# JSON output
+# ------------------------------------------------------------
+
+def usage_data(only=None, now=None, results=None):
+    """
+    Fetch usage and compute everything shown.
+
+    Returns a JSON-serializable dict: --json prints it
+    as is and the TUI renders it. `results` skips the fetch
+    (for tests).
+    """
+    if results is None:
+        results = collect(only)
+
+    now = now or now_local()
+
+    def iso(value):
+        return value.isoformat() if value else None
+
+    def percent(value):
+        # Same clamping and rounding as the screen.
+        if value is None:
+            return None
+
+        return int(max(0.0, min(100.0, float(value))) + 0.5)
+
+    def window(item):
+        expected = item.expected(now)
+
+        return {
+            "label": item.label,
+            "expected_percent": percent(expected),
+            "used_percent": percent(item.used),
+            "reset": iso(item.reset),
+            "reset_text": item.reset_text,
+        }
+
+    return {
+        "providers": {
+            key: {
+                "name": result.name,
+                "error": result.error,
+                "groups": [
+                    {
+                        "name": group.name,
+                        "windows": [
+                            window(item)
+                            for item in group.windows
+                        ],
+                    }
+                    for group in result.groups
+                ],
+            }
+            for key, result in results.items()
+        },
+        "agents": agent_scores(results, now),
+    }
+
+
 def set_title(text):
     if sys.stdout.isatty():
         # OSC 0: set the terminal window title.
@@ -1403,29 +1448,46 @@ def main():
         default=REFRESH_INTERVAL,
     )
 
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="print usage as JSON once and exit (implies --once)",
+    )
+
     args = parser.parse_args()
+
+    if args.json:
+        args.once = True
 
     if args.interval <= 0:
         parser.error(
             "--interval must be positive"
         )
 
+    if args.json:
+        print(json.dumps(
+            usage_data(args.only),
+            indent=2,
+            ensure_ascii=False,
+        ))
+        return
+
     tty = sys.stdout.isatty()
 
-    def draw(results):
+    def draw(data):
         if tty:
             sys.stdout.write("\033[H\033[2J")
 
         sys.stdout.write(
-            render_screen(results, args.interval)
+            render_screen(data, args.interval)
         )
 
-    # Last results, redrawn when the terminal is resized.
-    latest = {"results": None}
+    # Last data, redrawn when the terminal is resized.
+    latest = {"data": None}
 
     def on_resize(signum, frame):
-        if latest["results"] is not None:
-            draw(latest["results"])
+        if latest["data"] is not None:
+            draw(latest["data"])
             sys.stdout.flush()
 
     if tty and hasattr(signal, "SIGWINCH"):
@@ -1451,14 +1513,15 @@ def main():
             # pace regardless of how long fetching takes.
             next_start += args.interval
 
-            # 1. Fetch all providers in parallel.
-            results = collect(args.only)
+            # 1. Fetch all providers in parallel and compute
+            #    the data.
+            data = usage_data(args.only)
 
             # 2. Render only after all fetches finish, and
             #    replace the entire terminal view.
-            latest["results"] = results
-            draw(results)
-            set_title(summary_line(results))
+            latest["data"] = data
+            draw(data)
+            set_title(summary_line(data))
             sys.stdout.flush()
 
             if args.once:

@@ -37,7 +37,8 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(scores['agy-gemini'], 0)
         self.assertEqual(scores['agy-argon'], 0)
         with patch.object(usage, 'now_local', return_value=now):
-            raw_summary = usage.summary_line(results)
+            data = usage.usage_data(results=results)
+            raw_summary = usage.summary_line(data)
         self.assertEqual(len(raw_summary.split('    ')), 4)
         summary = raw_summary.split()
         self.assertEqual(summary[1::2], ['cdx', 'cld', 'agx', 'arg'])
