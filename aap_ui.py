@@ -1676,7 +1676,8 @@ UI_HTML = """<!doctype html>
   .review-box { margin: 8px 0 4px; padding: 8px 10px; background: rgba(110, 64, 201, 0.12); border: 1px solid rgba(137, 87, 229, 0.4); border-radius: 6px; font-size: 12.5px; color: #d2a8ff; }
   .pill.python { background: rgba(55, 118, 171, 0.25); color: #79b8ff; border-color: rgba(55, 118, 171, 0.6); font-weight: 600; }
   .py-script, .queue-content pre.py-script { max-height: calc(7.25em + 22px); overflow: hidden; border-left: 3px solid rgba(55, 118, 171, 0.7); white-space: pre-wrap; overflow-wrap: anywhere; }
-  .copy-bar { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 8px; }
+  .copy-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 2px 0 8px; }
+  .copy-meta { margin-left: auto; }
   .copy-btn { font-size: 11.5px; padding: 3px 8px; }
   .test-panel { display: flex; flex-direction: column; gap: 10px; max-width: 900px; }
   .test-label { font-size: 12.5px; color: var(--muted); font-family: ui-monospace, monospace; }
@@ -2203,13 +2204,15 @@ function renderPythonScript(script) {
 }
 
 // Body of a card: the script for Python, otherwise the formatted call.
-function renderCallBody(req, target, key) {
+// `meta` (queue cards: working directory and time) goes right-aligned on the
+// copy-button line.
+function renderCallBody(req, target, key, meta = '') {
   const command = target === req ? formatArgs(req) : target.command;
   const body = isPython(target) ? renderPythonScript(target.python_script) : `<pre>${esc(command)}</pre>`;
   const buttons = [copyBtn(key + '-cmd', 'Copy command', command)];
   if (isPython(target)) buttons.push(copyBtn(key + '-py', 'Copy script', target.python_script));
   if (target !== req) buttons.push(copyBtn(key + '-full', 'Copy full command', formatArgs(req)));
-  return body + `<div class="copy-bar">${buttons.join('')}</div>`;
+  return body + `<div class="copy-bar">${buttons.join('')}${meta ? `<div class="meta copy-meta">${meta}</div>` : ''}</div>`;
 }
 
 // Texts behind the copy buttons, by key, so they stay out of the HTML attributes.
@@ -2447,16 +2450,15 @@ function renderQueue() {
         const tokenBar = sc.python_script != null ? '' : renderTokenBar(req.id, sc.command_tokens || [], sc.command_prefixes || [], sc.index);
         const approveAction = renderApproveActions(req.id, sc, sc.index);
         const auto = autoAction(req, sc, sc.index);
-        const python = sc.python_script != null;
         cards.push({ key: req.id + '#' + sc.index, inputId: reasonInputId(req.id, sc.index), auto, html: `
           <div class="card">
             <div class="card-head">
               <div><span class="pill ${esc(rt)}">${esc(rt)}</span> ${toolLabel(req, sc)} <span class="pill">step ${sc.index + 1}/${req.subcommands.length}</span>${stalePill}</div>
-              <div class="meta">${python ? '' : renderAutoDecide(auto)}<span>${esc(cwd)}</span><span>${esc(req.created_at)}</span></div>
+              <div class="meta">${renderAutoDecide(auto)}</div>
             </div>
-            ${renderCallBody(req, sc, 'q-' + req.id + '-' + sc.index)}
+            ${renderCallBody(req, sc, 'q-' + req.id + '-' + sc.index, `<span>${esc(cwd)}</span><span>${esc(req.created_at)}</span>`)}
             <details class="full-cmd-box" ${openScripts.has('full-' + req.id) ? 'open' : ''} ontoggle="if (this.open) openScripts.add('full-${esc(req.id)}'); else openScripts.delete('full-${esc(req.id)}')"><summary>Full command</summary><pre>${esc(formatArgs(req))}</pre></details>
-            ${renderReviewBox(sc.review, python ? renderAutoDecide(auto) : '')}
+            ${renderReviewBox(sc.review)}
             ${tokenBar}
             <div class="actions">
               ${approveAction}
@@ -2479,15 +2481,14 @@ function renderQueue() {
       ? ''
       : `<button class="always" onclick="decide('${esc(req.id)}','approved','tool')" title="Allow always: ${esc(req.tool)}">Allow</button>`;
     const auto = autoAction(req, req, null);
-    const python = req.python_script != null;
     cards.push({ key: req.id, inputId: reasonInputId(req.id), auto, html: `
       <div class="card">
         <div class="card-head">
           <div><span class="pill ${esc(rt)}">${esc(rt)}</span> ${toolLabel(req)}${stalePill}</div>
-          <div class="meta">${python ? '' : renderAutoDecide(auto)}<span>${esc(cwd)}</span><span>${esc(req.created_at)}</span></div>
+          <div class="meta">${renderAutoDecide(auto)}</div>
         </div>
-        ${renderCallBody(req, req, 'q-' + req.id)}
-        ${renderReviewBox(req.review, python ? renderAutoDecide(auto) : '')}
+        ${renderCallBody(req, req, 'q-' + req.id, `<span>${esc(cwd)}</span><span>${esc(req.created_at)}</span>`)}
+        ${renderReviewBox(req.review)}
         ${tokenBar}
         <div class="actions">
           ${approveAction}
