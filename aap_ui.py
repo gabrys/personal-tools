@@ -1918,6 +1918,13 @@ const DECISION_LABEL_INFO = {
   'new-rule': ['+ rule', 'This decision created a permanent rule (linked below)'],
 };
 
+const GENERATED_REASONS = ['All subcommands matched allow rules', 'All subcommands approved', 'Approved in UI', 'Denied in UI'];
+function isGeneratedReason(reason) {
+  reason = reason || '';
+  return GENERATED_REASONS.includes(reason) || reason.startsWith('Matched rule (')
+    || reason.startsWith('Auto-accepted for 12h after') || reason.startsWith('Auto-accepted after review');
+}
+
 function renderDecisionLabels(req) {
   const labels = (req.decision && req.decision.labels) || [];
   return labels.map(l => {
@@ -2340,7 +2347,7 @@ function autoAction(req, target, subIndex) {
              verb: approved ? 'Auto-accept' : 'Auto-deny' };
   }
   return { key: base, reqId: req.id, subIndex, review: null,
-           decision: 'approved', allowAlways: 'exact', verb: 'Auto-accept (12h)' };
+           decision: 'approved', allowAlways: 'exact', verb: 'Auto-accept' };
 }
 
 function renderAutoDecide(action) {
@@ -2770,7 +2777,9 @@ function render() {
     app.innerHTML = filterBanner + items.map(req => {
       const rt = (req.context && req.context.runtime) || 'agent';
       const d = req.decision || {};
-      const reason = d.reason || '';
+      // Generated reasons ("Matched rule (...)", "Approved in UI", ...) only
+      // repeat the labels, so they are hidden when labels are present.
+      const reason = (Array.isArray(d.labels) && d.labels.length && isGeneratedReason(d.reason)) ? '' : (d.reason || '');
       const ruleIds = [];
       if (d.rule_id) ruleIds.push(d.rule_id);
       if (Array.isArray(d.rule_ids)) {
