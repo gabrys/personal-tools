@@ -2777,9 +2777,9 @@ function render() {
     app.innerHTML = filterBanner + items.map(req => {
       const rt = (req.context && req.context.runtime) || 'agent';
       const d = req.decision || {};
-      // Generated reasons ("Matched rule (...)", "Approved in UI", ...) only
-      // repeat the labels, so they are hidden when labels are present.
-      const reason = (Array.isArray(d.labels) && d.labels.length && isGeneratedReason(d.reason)) ? '' : (d.reason || '');
+      // Generated reasons ("Matched rule (...)", "Approved in UI", ...) are
+      // never shown: the labels say where a decision came from.
+      const reason = isGeneratedReason(d.reason) ? '' : (d.reason || '');
       const ruleIds = [];
       if (d.rule_id) ruleIds.push(d.rule_id);
       if (Array.isArray(d.rule_ids)) {
