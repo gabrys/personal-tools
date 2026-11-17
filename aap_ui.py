@@ -1703,7 +1703,7 @@ UI_HTML = """<!doctype html>
 </head>
 <body>
 <header>
-  <h1>AAP Approval Queue</h1>
+  <h1>aap-ui</h1>
   <div class="tabs">
     <button class="tab" data-tab="live">Rules</button>
     <button class="tab active" data-tab="history">History</button>
