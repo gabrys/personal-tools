@@ -454,6 +454,10 @@ def _rule_path_level(rule: "Rule") -> str:
     return "rw" if _path_tool_level(rule.tool) == "rw" else "ro"
 
 
+# Tools that run a shell command line (Claude Code/Codex, Antigravity).
+SHELL_TOOLS = {"Bash", "run_command"}
+
+
 @dataclass
 class Rule:
     id: str
@@ -493,7 +497,12 @@ class Rule:
                 return False
             path_val = _extract_path_arg(arguments)
             return isinstance(path_val, str) and _match_token_wildcard(self.prefix, path_val)
-        if self.tool != "*" and self.tool != tool:
+        if self.tool != "*" and self.tool != tool and not (
+            # A shell command is the same command whichever agent's shell
+            # tool runs it (Bash for Claude Code/Codex, run_command for
+            # Antigravity), so command rules apply across them.
+            self.kind == "command_prefix" and self.tool in SHELL_TOOLS and tool in SHELL_TOOLS
+        ):
             return False
         if self.kind == "tool":
             return True

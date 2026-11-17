@@ -337,6 +337,16 @@ class AAPUITest(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_command_rules_apply_across_shell_tools(self) -> None:
+        bash_git = aap_ui.Rule(id="r1", kind="command_prefix", tool="Bash", action="allow", prefix="git *")
+        agy_ls = aap_ui.Rule(id="r2", kind="command_prefix", tool="run_command", action="allow", prefix="ls *")
+        self.assertTrue(bash_git.matches("run_command", {"CommandLine": "git status -s"}))
+        self.assertTrue(agy_ls.matches("Bash", {"command": "ls -la docs/"}))
+        # Only shell tools share command rules.
+        self.assertFalse(bash_git.matches("SomeMcpTool", {"command": "git status"}))
+        tool_rule = aap_ui.Rule(id="r3", kind="tool", tool="Bash", action="allow")
+        self.assertFalse(tool_rule.matches("run_command", {"CommandLine": "rm -rf /"}))
+
     def test_choose_review_agent(self) -> None:
         def usage(claude: float | None, codex: float | None) -> dict:
             def prov(pct: float | None) -> dict:
