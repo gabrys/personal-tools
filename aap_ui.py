@@ -2323,17 +2323,32 @@ function renderReviewBox(review, autoHtml = '') {
     review.agent_reason ? `<div class="meta">${esc(review.agent_reason)}</div>` : '', review.explanation, autoHtml);
 }
 
-// Auto-decision: only the request currently shown in the queue counts down,
-// for AUTO_DECIDE_MS from the moment it is shown. When it fires and the next
-// request takes its place, that one starts its own countdown, so a long
+// Auto-decision: only the request currently shown in the queue is decided
+// automatically, and only while the operator is away. Any mouse or keyboard
+// activity over the page stops the countdown; once there has been none for
+// AUTO_IDLE_MS, a countdown of AUTO_DECIDE_MS starts. When it fires and the
+// next request takes its place, that one gets its own countdown, so a long
 // queue is decided one request at a time. Python scripts are auto-decided
 // only after a review (its verdict is applied); other requests are accepted
-// for 12h (exact call). Cancel, typing a reason, switching cards or deciding
-// manually all stop the current countdown.
+// for 12h (exact call). Typing a reason cancels the shown request's
+// auto-decision for good.
+const AUTO_IDLE_MS = 10000;
 const AUTO_DECIDE_MS = 30000;
 const autoCancelled = new Set();
 const autoFired = new Set();
-let autoCurrent = null;  // {key, reqId, subIndex, decision, allowAlways, verb, review, deadline}
+let autoCurrent = null;  // {key, reqId, subIndex, decision, allowAlways, verb, review, deadline|null}
+let lastActivity = Date.now();
+
+function noteActivity() {
+  lastActivity = Date.now();
+  if (autoCurrent && autoCurrent.deadline !== null) {
+    autoCurrent.deadline = null;
+    updateAutoCounts();
+  }
+}
+for (const ev of ['mousemove', 'mousedown', 'wheel', 'keydown', 'touchstart']) {
+  document.addEventListener(ev, noteActivity, { capture: true, passive: true });
+}
 
 function autoAction(req, target, subIndex) {
   if (req.status !== 'pending') return null;
@@ -2354,19 +2369,19 @@ function renderAutoDecide(action) {
   if (!action) return '';
   if (autoCancelled.has(action.key)) return '<span class="auto-decide u-dim">Auto-decision cancelled</span>';
   return `<span class="auto-decide ${action.decision === 'approved' ? 'status-approved' : 'status-denied'}">` +
-    `<span class="auto-count"></span>` +
-    `<button class="ghost" onclick="cancelAutoDecide('${esc(action.key)}')">Cancel</button></span>`;
+    `<span class="auto-count"></span></span>`;
 }
 
-// Called by render() with the card now shown; keeps the running deadline
-// while the same card stays shown, starts a fresh one when it changes.
+// Called by render() with the card now shown; keeps the running countdown
+// while the same card stays shown. A newly shown card starts without one;
+// autoDecideTick() starts it once the operator has been idle long enough.
 function syncAutoCurrent(card) {
   const a = card && card.auto;
   if (!a || activeTab === 'test' || autoCancelled.has(a.key) || autoFired.has(a.key)) {
     autoCurrent = null;
     return;
   }
-  const deadline = autoCurrent && autoCurrent.key === a.key ? autoCurrent.deadline : Date.now() + AUTO_DECIDE_MS;
+  const deadline = autoCurrent && autoCurrent.key === a.key ? autoCurrent.deadline : null;
   autoCurrent = { ...a, deadline };
 }
 
@@ -2391,7 +2406,9 @@ function updateTitle(now = Date.now()) {
   let title = 'aap-ui';
   if (titlePending) {
     let lead = `${titlePending} ${titlePending === 1 ? 'request' : 'requests'}`;
-    if (autoCurrent) lead += ` (${Math.max(0, Math.ceil((autoCurrent.deadline - now) / 1000))}s)`;
+    if (autoCurrent && autoCurrent.deadline !== null) {
+      lead += ` (${Math.max(0, Math.ceil((autoCurrent.deadline - now) / 1000))}s)`;
+    }
     title = `${lead} · ${title}`;
   }
   if (document.title !== title) document.title = title;
@@ -2400,7 +2417,7 @@ function updateTitle(now = Date.now()) {
 function updateAutoCounts(now = Date.now()) {
   updateTitle(now);
   for (const el of document.querySelectorAll('.auto-count')) {
-    if (!autoCurrent) { el.textContent = ''; continue; }
+    if (!autoCurrent || autoCurrent.deadline === null) { el.textContent = ''; continue; }
     const left = Math.max(0, Math.ceil((autoCurrent.deadline - now) / 1000));
     el.textContent = `${autoCurrent.verb} in ${left}s`;
   }
@@ -2408,9 +2425,10 @@ function updateAutoCounts(now = Date.now()) {
 
 async function autoDecideTick() {
   const now = Date.now();
-  updateAutoCounts(now);
   const a = autoCurrent;
-  if (!a || now < a.deadline || autoFired.has(a.key)) return;
+  if (a && a.deadline === null && now - lastActivity >= AUTO_IDLE_MS) a.deadline = now + AUTO_DECIDE_MS;
+  updateAutoCounts(now);
+  if (!a || a.deadline === null || now < a.deadline || autoFired.has(a.key)) return;
   autoFired.add(a.key);
   autoCurrent = null;
   const inputId = reasonInputId(a.reqId, a.subIndex);
