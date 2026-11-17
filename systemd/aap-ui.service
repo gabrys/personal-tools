@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=%h/git/personal-tools
-ExecStart=/usr/bin/python3 %h/git/personal-tools/aap_ui.py serve
+ExecStart=/usr/bin/python3 %h/git/personal-tools/aap_ui.py serve --host 127.0.0.1 --port 8787
 # The auto-reviewer runs claude/codex from ~/.local/bin.
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
