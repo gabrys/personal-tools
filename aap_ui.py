@@ -2384,17 +2384,16 @@ function cancelAutoDecideForInput(inputId) {
   }
 }
 
-// Tab title: app name, the pending count and the running auto-action
-// countdown, e.g. "aap-ui (3) accept in 12s"; just the name when idle.
+// Tab title: pending count with the running auto-action countdown, then the
+// app name, e.g. "3 requests (12s) · aap-ui"; just "aap-ui" when idle.
 let titlePending = 0;
 function updateTitle(now = Date.now()) {
-  const parts = ['aap-ui'];
-  if (titlePending) parts.push(`(${titlePending})`);
-  if (autoCurrent) {
-    const left = Math.max(0, Math.ceil((autoCurrent.deadline - now) / 1000));
-    parts.push(`${autoCurrent.decision === 'approved' ? 'accept' : 'deny'} in ${left}s`);
+  let title = 'aap-ui';
+  if (titlePending) {
+    let lead = `${titlePending} ${titlePending === 1 ? 'request' : 'requests'}`;
+    if (autoCurrent) lead += ` (${Math.max(0, Math.ceil((autoCurrent.deadline - now) / 1000))}s)`;
+    title = `${lead} · ${title}`;
   }
-  const title = parts.join(' ');
   if (document.title !== title) document.title = title;
 }
 
@@ -2863,6 +2862,8 @@ def make_handler(
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            # Live state: never let the browser serve a cached copy.
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
 
