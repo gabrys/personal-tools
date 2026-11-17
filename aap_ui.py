@@ -463,8 +463,9 @@ SHELL_TOOLS = {"Bash", "run_command"}
 #   ai-review - a finished AI review of the script was available
 #   click     - the operator clicked
 #   lazy      - no operator reaction; applied automatically after 30s
-#   new-rule  - this decision created a rule
-DECISION_LABELS = ["rule", "prior", "ai-review", "click", "lazy", "new-rule"]
+#   new-12h   - this decision accepted this exact call for 12h (exact rule)
+#   new-rule  - this decision created a permanent rule
+DECISION_LABELS = ["rule", "prior", "ai-review", "click", "lazy", "new-12h", "new-rule"]
 
 
 def rule_label(rule: "Rule") -> str:
@@ -1232,7 +1233,7 @@ class ApprovalHub:
             own_labels = merge_labels(
                 ["ai-review"] if isinstance(review, dict) and review.get("status") == "done" and review.get("decision") else [],
                 ["lazy" if lazy else "click"],
-                ["new-rule"] if created_rule is not None else [],
+                [] if created_rule is None else ["new-12h" if created_rule.get("kind") == "exact" else "new-rule"],
             )
 
             if target_sub is not None:
@@ -1586,6 +1587,8 @@ UI_HTML = """<!doctype html>
   .hits-link:hover { background: rgba(31, 111, 235, 0.24); border-color: #58a6ff; color: #fff; }
   .filter-bar { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 14px; margin-bottom: 12px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; font-size: 13px; color: var(--muted); }
   .rule-jump-link { display: inline-flex; align-items: center; gap: 4px; font-family: ui-monospace, monospace; font-size: 11.5px; color: #79c0ff; background: rgba(31, 111, 235, 0.12); border: 1px solid rgba(88, 166, 255, 0.3); border-radius: 4px; padding: 1px 7px; text-decoration: none; cursor: pointer; transition: background 0.1s, border-color 0.1s, color 0.1s; }
+  /* Exact-call rules can carry whole file contents: clip the link to 2 lines. */
+  .rule-jump-link { display: inline-block; vertical-align: top; max-width: 100%; max-height: calc(2 * 1.45em + 4px); overflow: hidden; line-height: 1.45; overflow-wrap: anywhere; }
   .rule-jump-link:hover { background: rgba(31, 111, 235, 0.28); border-color: #58a6ff; color: #fff; }
   @keyframes rulePulse {
     0% { border-color: #58a6ff; box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.45); background: #263142; }
@@ -1685,7 +1688,7 @@ UI_HTML = """<!doctype html>
   .dl-ai-review { color: #d2a8ff; border-color: rgba(137, 87, 229, 0.5); background: rgba(137, 87, 229, 0.14); }
   .dl-click { color: #c9d1d9; border-color: var(--border); background: #21262d; }
   .dl-lazy { color: #e3b341; border-color: rgba(210, 153, 34, 0.5); background: rgba(210, 153, 34, 0.14); }
-  .dl-new-rule { color: #7ee787; border-color: rgba(63, 185, 80, 0.5); background: rgba(63, 185, 80, 0.12); }
+  .dl-new-rule, .dl-new-12h { color: #7ee787; border-color: rgba(63, 185, 80, 0.5); background: rgba(63, 185, 80, 0.12); }
   .verdict-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
   .auto-decide { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .auto-decide button { padding: 2px 10px; font-size: 12px; font-weight: 400; }
@@ -1907,7 +1910,8 @@ const DECISION_LABEL_INFO = {
   'ai-review': ['AI review', 'Decided with an AI review of the script'],
   'click': ['click', 'The operator clicked'],
   'lazy': ['lazy', 'No operator reaction: applied automatically after 30s'],
-  'new-rule': ['+ rule', 'This decision created a rule (linked on the right)'],
+  'new-12h': ['+ 12h', 'This decision accepted this exact call for 12h (linked below)'],
+  'new-rule': ['+ rule', 'This decision created a permanent rule (linked below)'],
 };
 
 function renderDecisionLabels(req) {
@@ -2777,7 +2781,7 @@ function render() {
         const ruleObj = state.rules.find(r => r.id === rid);
         if (!ruleObj) return '';
         const lbl = ruleObj.kind === 'tool' ? ruleObj.tool : (formatCommandRule(ruleObj) || ruleObj.tool || rid);
-        return `<a href="#rule-${esc(rid)}" class="rule-jump-link" onclick="jumpToRule('${esc(rid)}');return false;" title="Jump to rule">↳ ${esc(lbl)}</a>`;
+        return `<a href="#rule-${esc(rid)}" class="rule-jump-link" onclick="jumpToRule('${esc(rid)}');return false;" title="Jump to rule: ${esc(lbl)}">↳ ${esc(lbl)}</a>`;
       }).filter(Boolean).join(' ');
       return `
         <div class="card">

@@ -851,14 +851,15 @@ class AAPUITest(unittest.TestCase):
 
         # Click Accept creates a 12h exact rule; the same call later is a prior accept.
         first = decide(create("uname -a", "l1"), decision="approved", allow_always="exact")
-        self.assertEqual(first["decision"]["labels"], ["click", "new-rule"])
+        self.assertEqual(first["decision"]["labels"], ["click", "new-12h"])
         self.assertEqual(create("uname -a", "l2")["decision"]["labels"], ["prior"])
         # Prefix token creates a permanent rule; matches later are labelled "rule".
-        decide(create("git status -s", "l3"), decision="approved", allow_always="prefix", prefix="git status *")
+        perm = decide(create("git status -s", "l3"), decision="approved", allow_always="prefix", prefix="git status *")
+        self.assertEqual(perm["decision"]["labels"], ["click", "new-rule"])
         self.assertEqual(create("git status", "l4")["decision"]["labels"], ["rule"])
         # Automatic decision without operator reaction.
         lazy = decide(create("uptime", "l5"), decision="approved", allow_always="exact", lazy=True)
-        self.assertEqual(lazy["decision"]["labels"], ["lazy", "new-rule"])
+        self.assertEqual(lazy["decision"]["labels"], ["lazy", "new-12h"])
         # Manual deny creates no rule.
         denied = decide(create("whoami", "l6"), decision="denied", reason="no")
         self.assertEqual(denied["decision"]["labels"], ["click"])
