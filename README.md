@@ -82,4 +82,14 @@ systemctl --user restart aap-ui       # after pulling changes
 
 Without `loginctl enable-linger $USER` it starts at login, not at boot.
 
+`systemd/aap-ui-tunnel.service` runs `cloudflared_notify.py` alongside it: it starts and
+stops with `aap-ui.service` and posts the tunnel URL to `AAP_TUNNEL_POST_URL`, read from
+`~/.config/aap-ui/tunnel.env` (kept out of the repo):
+
+```
+echo 'AAP_TUNNEL_POST_URL=https://example.com/note/Tunnel' > ~/.config/aap-ui/tunnel.env
+systemctl --user link ~/git/personal-tools/systemd/aap-ui-tunnel.service
+systemctl --user enable --now aap-ui-tunnel.service
+```
+
 Run tests with `python3 -m unittest discover -s tests -v`.

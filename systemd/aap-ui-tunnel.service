@@ -1,0 +1,19 @@
+[Unit]
+Description=aap-ui: Cloudflare tunnel to the local aap-ui, URL posted to a note
+Requires=aap-ui.service
+After=aap-ui.service
+PartOf=aap-ui.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/git/personal-tools
+# Defines AAP_TUNNEL_POST_URL; kept out of the repo because the note reveals the tunnel URL.
+EnvironmentFile=%h/.config/aap-ui/tunnel.env
+ExecStart=/usr/bin/python3 %h/git/personal-tools/cloudflared_notify.py --url http://127.0.0.1:8787 --post-url ${AAP_TUNNEL_POST_URL}
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=aap-ui.service
