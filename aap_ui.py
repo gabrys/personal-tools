@@ -457,6 +457,25 @@ def _rule_path_level(rule: "Rule") -> str:
 # Tools that run a shell command line (Claude Code/Codex, Antigravity).
 SHELL_TOOLS = {"Bash", "run_command"}
 
+# Where a decision came from, stored as decision["labels"] (in this order):
+#   rule      - an existing permanent rule matched
+#   prior     - an earlier Accept (12h exact-call rule) matched
+#   ai-review - a finished AI review of the script was available
+#   click     - the operator clicked
+#   lazy      - no operator reaction; applied automatically after 30s
+#   new-rule  - this decision created a rule
+DECISION_LABELS = ["rule", "prior", "ai-review", "click", "lazy", "new-rule"]
+
+
+def rule_label(rule: "Rule") -> str:
+    return "prior" if rule.kind == "exact" else "rule"
+
+
+def merge_labels(*groups: Any) -> list[str]:
+    """Union of label lists, in DECISION_LABELS order."""
+    found = {label for group in groups for label in (group or []) if label in DECISION_LABELS}
+    return [label for label in DECISION_LABELS if label in found]
+
 
 @dataclass
 class Rule:
@@ -772,7 +791,52 @@ class ApprovalHub:
         self._history: deque[str] = deque(maxlen=history_limit)
         self._subscribers: set[queue.Queue[str]] = set()
         self._queue_path = self.rules.path.with_name("queue.json")
+        # Every decision is appended here (one JSON record per line), so the
+        # History tab survives restarts and wait times can be analysed later.
+        self._history_path = self.rules.path.with_name("history.jsonl")
+        self._load_history()
         self._load_queue()
+
+    def _load_history(self) -> None:
+        """Restore the most recent decided records from history.jsonl."""
+        if not self._history_path.exists():
+            return
+        latest: dict[str, dict[str, Any]] = {}
+        try:
+            with self._history_path.open(encoding="utf-8") as f:
+                # A request can be logged more than once (e.g. expired, then
+                # decided); the last line for an id wins.
+                for line in deque(f, maxlen=(self._history.maxlen or 100) * 5):
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(item, dict) and item.get("id"):
+                        latest.pop(item["id"], None)
+                        latest[item["id"]] = item
+        except OSError:
+            return
+        for item in latest.values():  # oldest first, so the newest ends up in front
+            item.pop("logged_at", None)
+            item["in_queue"] = False
+            self._requests[item["id"]] = item
+            self._history.appendleft(item["id"])
+
+    def _add_history(self, req_id: str) -> None:
+        """Move req_id to the front of the history and append it to the log."""
+        if req_id in self._history:
+            self._history.remove(req_id)
+        self._history.appendleft(req_id)
+        record = self._requests.get(req_id)
+        if record is None:
+            return
+        try:
+            self._history_path.parent.mkdir(parents=True, exist_ok=True)
+            line = json.dumps({**self._public_view(record), "logged_at": utc_now_iso()}, ensure_ascii=False)
+            with self._history_path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
 
     def _load_queue(self) -> None:
         if not self._queue_path.exists():
@@ -865,10 +929,12 @@ class ApprovalHub:
             elif len(sub_cmds) > 1:
                 all_approved = True
                 any_denied: Rule | None = None
+                allow_labels: set[str] = set()
                 for idx, sc in enumerate(sub_cmds):
                     sc_rule = self.rules.match(tool, {"command": sc})
                     sc_tokens, sc_prefixes = command_tokens_and_prefixes(sc)
                     if sc_rule is not None and sc_rule.action == "allow":
+                        allow_labels.add(rule_label(sc_rule))
                         sc_status = "approved"
                     elif sc_rule is not None and sc_rule.action == "deny":
                         sc_status = "denied"
@@ -888,6 +954,7 @@ class ApprovalHub:
                             "python_script": extract_reviewable_python_script(sc),
                             "review": None,
                             "rule_id": sc_rule.id if sc_rule else None,
+                            "labels": [rule_label(sc_rule)] if sc_rule else [],
                         }
                     )
                 if any_denied is not None:
@@ -897,6 +964,7 @@ class ApprovalHub:
                         "decided_at": now,
                         "reason": f"Matched rule ({any_denied.kind})",
                         "rule_id": any_denied.id,
+                        "labels": [rule_label(any_denied)],
                     }
                 elif all_approved:
                     status = "approved"
@@ -905,6 +973,7 @@ class ApprovalHub:
                         "decided_at": now,
                         "reason": "All subcommands matched allow rules",
                         "rule_ids": [sc["rule_id"] for sc in subcommands if sc.get("rule_id")],
+                        "labels": merge_labels(allow_labels),
                     }
                 else:
                     status = "pending"
@@ -920,6 +989,7 @@ class ApprovalHub:
                         "decided_at": now,
                         "reason": f"Matched rule ({matched.kind})",
                         "rule_id": matched.id,
+                        "labels": [rule_label(matched)],
                     }
 
             path_val = _extract_path_arg(arguments)
@@ -981,7 +1051,7 @@ class ApprovalHub:
                 elif record["python_script"] is not None:
                     self.review_request(req_id)
             if status in TERMINAL_STATUSES:
-                self._history.appendleft(req_id)
+                self._add_history(req_id)
             else:
                 self._save_queue()
             self._cond.notify_all()
@@ -1002,8 +1072,7 @@ class ApprovalHub:
                 "decided_at": utc_now_iso(),
                 "reason": "Approval request timed out",
             }
-            if record["id"] not in self._history:
-                self._history.appendleft(record["id"])
+            self._add_history(record["id"])
             self._save_queue()
             self._cond.notify_all()
             self._notify_ui()
@@ -1035,7 +1104,10 @@ class ApprovalHub:
         allow_always: str | None = None,
         prefix: str = "",
         sub_index: int | None = None,
+        lazy: bool = False,
     ) -> dict[str, Any] | None:
+        """Decide from the UI; `lazy` marks an automatic decision made because
+        the operator did not react (labels the decision "lazy", not "click")."""
         if decision_status not in {"approved", "denied"}:
             raise ValueError("invalid_decision")
         with self._cond:
@@ -1126,6 +1198,7 @@ class ApprovalHub:
                                 ):
                                     sc["status"] = "approved"
                                     sc["rule_id"] = matched_rule.id
+                                    sc["labels"] = [rule_label(matched_rule)]
                                     if sc is not target_sub:
                                         self.rules.record_hit(matched_rule.id)
                             if all(sc["status"] == "approved" for sc in other_subs):
@@ -1136,8 +1209,9 @@ class ApprovalHub:
                                     "decided_at": utc_now_iso(),
                                     "reason": f"Matched rule ({matched_rule.kind})",
                                     "rule_id": matched_rule.id,
+                                    "labels": merge_labels(*(s.get("labels") for s in other_subs)),
                                 }
-                                self._history.appendleft(other["id"])
+                                self._add_history(other["id"])
                         elif other["id"] != req_id and matched_rule.matches(
                             other["tool"], other["arguments"]
                         ):
@@ -1148,12 +1222,22 @@ class ApprovalHub:
                                 "decided_at": utc_now_iso(),
                                 "reason": f"Matched rule ({matched_rule.kind})",
                                 "rule_id": matched_rule.id,
+                                "labels": [rule_label(matched_rule)],
                             }
-                            self._history.appendleft(other["id"])
+                            self._add_history(other["id"])
                             self.rules.record_hit(matched_rule.id)
+
+            target = target_sub if target_sub is not None else record
+            review = target.get("review")
+            own_labels = merge_labels(
+                ["ai-review"] if isinstance(review, dict) and review.get("status") == "done" and review.get("decision") else [],
+                ["lazy" if lazy else "click"],
+                ["new-rule"] if created_rule is not None else [],
+            )
 
             if target_sub is not None:
                 target_sub["status"] = decision_status
+                target_sub["labels"] = own_labels
                 if created_rule is not None:
                     target_sub["rule_id"] = created_rule["id"]
                 if decision_status == "denied":
@@ -1163,8 +1247,9 @@ class ApprovalHub:
                         "status": "denied",
                         "decided_at": utc_now_iso(),
                         "reason": reason.strip() or f"Denied subcommand: {target_sub['command']}",
+                        "labels": own_labels,
                     }
-                    self._history.appendleft(req_id)
+                    self._add_history(req_id)
                 elif all(sc["status"] == "approved" for sc in subcommands):
                     record["status"] = "approved"
                     record["in_queue"] = False
@@ -1172,10 +1257,11 @@ class ApprovalHub:
                         "status": "approved",
                         "decided_at": utc_now_iso(),
                         "reason": reason.strip() or "All subcommands approved",
+                        "labels": merge_labels(*(sc.get("labels") for sc in subcommands)),
                     }
                     if created_rule is not None:
                         record["decision"]["rule_id"] = created_rule["id"]
-                    self._history.appendleft(req_id)
+                    self._add_history(req_id)
                 self._save_queue()
                 self._cond.notify_all()
                 self._notify_ui()
@@ -1189,10 +1275,11 @@ class ApprovalHub:
                 "reason": reason.strip() or (
                     "Approved in UI" if decision_status == "approved" else "Denied in UI"
                 ),
+                "labels": own_labels,
             }
             if created_rule is not None:
                 record["decision"]["rule_id"] = created_rule["id"]
-            self._history.appendleft(req_id)
+            self._add_history(req_id)
             self._save_queue()
             self._cond.notify_all()
             self._notify_ui()
@@ -1303,8 +1390,7 @@ class ApprovalHub:
                     "decided_at": utc_now_iso(),
                     "reason": "Cancelled by agent",
                 }
-                if record["id"] not in self._history:
-                    self._history.appendleft(record["id"])
+                self._add_history(record["id"])
                 self._save_queue()
                 self._cond.notify_all()
                 self._notify_ui()
@@ -1592,6 +1678,14 @@ UI_HTML = """<!doctype html>
   .test-result { padding: 10px 12px; border-radius: 6px; border: 1px solid var(--border); display: flex; flex-direction: column; gap: 6px; }
   .test-result.approved { border-color: rgba(63, 185, 80, 0.6); background: rgba(63, 185, 80, 0.08); }
   .test-result.denied { border-color: rgba(248, 81, 73, 0.6); background: rgba(248, 81, 73, 0.08); }
+  /* Decision-source labels in History. */
+  .pill.dl { font-size: 11px; vertical-align: 1px; }
+  .dl-rule { color: #79c0ff; border-color: rgba(56, 139, 253, 0.5); background: rgba(56, 139, 253, 0.12); }
+  .dl-prior { color: #56d4dd; border-color: rgba(57, 197, 207, 0.5); background: rgba(57, 197, 207, 0.12); }
+  .dl-ai-review { color: #d2a8ff; border-color: rgba(137, 87, 229, 0.5); background: rgba(137, 87, 229, 0.14); }
+  .dl-click { color: #c9d1d9; border-color: var(--border); background: #21262d; }
+  .dl-lazy { color: #e3b341; border-color: rgba(210, 153, 34, 0.5); background: rgba(210, 153, 34, 0.14); }
+  .dl-new-rule { color: #7ee787; border-color: rgba(63, 185, 80, 0.5); background: rgba(63, 185, 80, 0.12); }
   .verdict-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
   .auto-decide { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .auto-decide button { padding: 2px 10px; font-size: 12px; font-weight: 400; }
@@ -1604,8 +1698,8 @@ UI_HTML = """<!doctype html>
 <header>
   <h1>AAP Approval Queue</h1>
   <div class="tabs">
-    <button class="tab active" data-tab="live">Rules</button>
-    <button class="tab" data-tab="history">History</button>
+    <button class="tab" data-tab="live">Rules</button>
+    <button class="tab active" data-tab="history">History</button>
     <button class="tab" data-tab="usage">AI usage</button>
   </div>
   <div id="header-usage" class="hu" aria-label="AI usage" hidden></div>
@@ -1624,7 +1718,7 @@ UI_HTML = """<!doctype html>
 </section>
 <script>
 let state = { pending: [], history: [], rules: [] };
-let activeTab = 'live';
+let activeTab = 'history';
 let editingRuleId = null;
 let historyRuleFilter = null;
 let highlightedRuleId = null;
@@ -1645,7 +1739,8 @@ document.getElementById('queue-content').addEventListener('input', event => {
 });
 
 // `test` has no tab button; it is reachable only via /test.
-const TAB_PATHS = { live: '/', history: '/history', usage: '/ai-usage', test: '/test' };
+// History is the default tab (at /); /history stays as an alias for old links.
+const TAB_PATHS = { live: '/rules', history: '/', usage: '/ai-usage', test: '/test' };
 
 let testResult = null;
 let testRunning = false;
@@ -1709,7 +1804,8 @@ async function runTest() {
 }
 
 function tabFromPath() {
-  return Object.keys(TAB_PATHS).find(t => TAB_PATHS[t] === location.pathname) || 'live';
+  if (location.pathname === '/history') return 'history';
+  return Object.keys(TAB_PATHS).find(t => TAB_PATHS[t] === location.pathname) || 'history';
 }
 
 // Switches tabs and keeps the URL in sync; `push` is false when the URL
@@ -1801,6 +1897,35 @@ function renderHeaderUsage() {
   headerUsageMarkup = markup;
   el.innerHTML = markup;
   el.hidden = !markup;
+}
+
+// Where a decision came from (decision.labels, set by the server). Records
+// without labels (decided before they existed) show none.
+const DECISION_LABEL_INFO = {
+  'rule': ['rule', 'An existing rule matched'],
+  'prior': ['prior accept', 'An earlier Accept (12h) of this exact call matched'],
+  'ai-review': ['AI review', 'Decided with an AI review of the script'],
+  'click': ['click', 'The operator clicked'],
+  'lazy': ['lazy', 'No operator reaction: applied automatically after 30s'],
+  'new-rule': ['+ rule', 'This decision created a rule (linked on the right)'],
+};
+
+function renderDecisionLabels(req) {
+  const labels = (req.decision && req.decision.labels) || [];
+  return labels.map(l => {
+    const [text, tip] = DECISION_LABEL_INFO[l] || [l, ''];
+    return ` <span class="pill dl dl-${esc(l)}" title="${esc(tip)}">${esc(text)}</span>`;
+  }).join('');
+}
+
+// How long the agent waited for the decision (omitted for instant rule matches).
+function fmtWaited(req) {
+  const d = req.decision || {};
+  const ms = Date.parse(d.decided_at) - Date.parse(req.created_at);
+  if (isNaN(ms) || ms < 1000) return '';
+  const s = Math.round(ms / 1000);
+  const text = s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m`;
+  return `<span title="Time from request to decision">waited ${text}</span>`;
 }
 
 function fmtReset(iso) {
@@ -2056,8 +2181,12 @@ function isPython(target) {
 }
 
 // Tool label for the card head: inline `python3 -c` scripts show as Python.
+// Shell tools (Bash for Claude Code/Codex, run_command for Antigravity) all
+// run a command line, so they share one label; the real name is the tooltip.
+const SHELL_TOOL_NAMES = ['Bash', 'run_command'];
 function toolLabel(req, target = req) {
   if (isPython(target)) return `<span class="pill python">Python</span>`;
+  if (SHELL_TOOL_NAMES.includes(req.tool)) return `<strong title="${esc(req.tool)}">run</strong>`;
   return `<strong>${esc(req.tool)}</strong>`;
 }
 
@@ -2265,7 +2394,7 @@ async function autoDecideTick() {
     await fetch('/api/ui/requests/' + encodeURIComponent(a.reqId) + '/decision', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ decision: a.decision, reason, allow_always: a.allowAlways, prefix: '', sub_index: a.subIndex }),
+      body: JSON.stringify({ decision: a.decision, reason, allow_always: a.allowAlways, prefix: '', sub_index: a.subIndex, lazy: true }),
     });
   } catch (e) {}
   await fetchState();
@@ -2653,8 +2782,8 @@ function render() {
       return `
         <div class="card">
           <div class="card-head">
-            <div><span class="pill ${esc(rt)}">${esc(rt)}</span> ${toolLabel(req)} <span class="status-${esc(req.status)}">${esc(req.status)}</span></div>
-            <div class="meta">${ruleLinks}<span>${esc(reason)}</span><span>${esc(req.created_at)}</span></div>
+            <div><span class="pill ${esc(rt)}">${esc(rt)}</span> ${toolLabel(req)} <span class="status-${esc(req.status)}">${esc(req.status)}</span>${renderDecisionLabels(req)}</div>
+            <div class="meta">${ruleLinks}<span>${esc(reason)}</span>${fmtWaited(req)}<span>${esc(req.created_at)}</span></div>
           </div>
           ${renderCallBody(req, req, 'h-' + req.id)}
         </div>`;
@@ -2719,7 +2848,7 @@ def make_handler(
             path = parsed.path
             qs = urllib.parse.parse_qs(parsed.query)
 
-            if path in ("/", "/history", "/ai-usage", "/test"):
+            if path in ("/", "/rules", "/history", "/ai-usage", "/test"):
                 body = UI_HTML.encode("utf-8")
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -2842,6 +2971,7 @@ def make_handler(
                         allow_always=payload.get("allow_always"),
                         prefix=str(payload.get("prefix") or ""),
                         sub_index=payload.get("sub_index"),
+                        lazy=bool(payload.get("lazy")),
                     )
                 except (ValueError, json.JSONDecodeError) as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})

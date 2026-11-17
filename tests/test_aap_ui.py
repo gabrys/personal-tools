@@ -309,7 +309,7 @@ class AAPUITest(unittest.TestCase):
         self.assertIsNone(snap["data"])
 
     def test_tab_urls_serve_the_ui(self) -> None:
-        for path in ("/", "/history", "/ai-usage"):
+        for path in ("/", "/rules", "/history", "/ai-usage"):
             with urllib.request.urlopen(f"{self.base_url}{path}", timeout=5.0) as resp:
                 self.assertEqual(resp.status, 200)
                 self.assertIn("AAP Approval Queue", resp.read().decode("utf-8"))
@@ -840,6 +840,47 @@ class AAPUITest(unittest.TestCase):
         _, ui_state = self._req("GET", "/api/ui/state")
         self.assertEqual(ui_state["pending"], [])
         self.assertEqual(ui_state["history"], [])
+
+    def test_decision_labels(self) -> None:
+        def create(cmd: str, key: str) -> dict:
+            return self._req("POST", "/api/aap/v1/requests",
+                             {"tool": "Bash", "arguments": {"command": cmd}}, {"Idempotency-Key": key})[1]
+
+        def decide(req: dict, **body) -> dict:
+            return self._req("POST", f"/api/ui/requests/{req['id']}/decision", body)[1]
+
+        # Click Accept creates a 12h exact rule; the same call later is a prior accept.
+        first = decide(create("uname -a", "l1"), decision="approved", allow_always="exact")
+        self.assertEqual(first["decision"]["labels"], ["click", "new-rule"])
+        self.assertEqual(create("uname -a", "l2")["decision"]["labels"], ["prior"])
+        # Prefix token creates a permanent rule; matches later are labelled "rule".
+        decide(create("git status -s", "l3"), decision="approved", allow_always="prefix", prefix="git status *")
+        self.assertEqual(create("git status", "l4")["decision"]["labels"], ["rule"])
+        # Automatic decision without operator reaction.
+        lazy = decide(create("uptime", "l5"), decision="approved", allow_always="exact", lazy=True)
+        self.assertEqual(lazy["decision"]["labels"], ["lazy", "new-rule"])
+        # Manual deny creates no rule.
+        denied = decide(create("whoami", "l6"), decision="denied", reason="no")
+        self.assertEqual(denied["decision"]["labels"], ["click"])
+
+    def test_history_is_logged_to_jsonl_and_reloaded(self) -> None:
+        _, a = self._req("POST", "/api/aap/v1/requests",
+                         {"tool": "Bash", "arguments": {"command": "echo one"}}, {"Idempotency-Key": "h-1"})
+        _, b = self._req("POST", "/api/aap/v1/requests",
+                         {"tool": "Bash", "arguments": {"command": "echo two"}}, {"Idempotency-Key": "h-2"})
+        self._req("POST", f"/api/ui/requests/{a['id']}/decision", {"decision": "approved"})
+        self._req("POST", f"/api/ui/requests/{b['id']}/decision", {"decision": "denied", "reason": "nope"})
+
+        log = self.rules_path.with_name("history.jsonl")
+        lines = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([(r["id"], r["status"]) for r in lines], [(a["id"], "approved"), (b["id"], "denied")])
+        self.assertTrue(all(r["logged_at"] and r["decision"]["decided_at"] for r in lines))
+
+        reloaded = aap_ui.ApprovalHub(aap_ui.RuleStore(self.rules_path))
+        history = reloaded.ui_state()["history"]
+        self.assertEqual([r["id"] for r in history], [b["id"], a["id"]])
+        self.assertEqual(history[0]["decision"]["reason"], "nope")
+        self.assertEqual(reloaded.ui_state()["pending"], [])
 
     def test_expired_and_cancelled_stay_in_queue_until_decided_and_persist(self) -> None:
         _, exp_req = self._req(
