@@ -1757,7 +1757,7 @@ function renderVerdict(decision, reason, stage, extra = '', explanation = '', he
   const ok = decision === 'approved';
   return `
     <div class="test-result ${ok ? 'approved' : 'denied'}">
-      <div class="verdict-head"><span><strong class="status-${esc(decision)}">${ok ? 'ACCEPTED' : 'REJECTED'}</strong>
+      <div class="verdict-head"><span><strong class="status-${esc(decision)}">${ok ? 'LOOKS GOOD' : 'REQUEST CHANGES'}</strong>
         <span class="pill">${esc(stage || '')}</span></span>${headExtra}</div>
       ${explanation ? `<div><strong>Script:</strong> ${esc(explanation)}</div>` : ''}
       ${reason ? `<div>${esc(reason)}</div>` : ''}
