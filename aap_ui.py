@@ -1726,7 +1726,8 @@ UI_HTML = """<!doctype html>
   }
   .review-box { margin: 8px 0 4px; padding: 8px 10px; background: rgba(110, 64, 201, 0.12); border: 1px solid rgba(137, 87, 229, 0.4); border-radius: 6px; font-size: 12.5px; color: #d2a8ff; }
   .pill.python { background: rgba(55, 118, 171, 0.25); color: #79b8ff; border-color: rgba(55, 118, 171, 0.6); font-weight: 600; }
-  .py-script, .queue-content pre.py-script { max-height: calc(7.25em + 22px); overflow: hidden; border-left: 3px solid rgba(55, 118, 171, 0.7); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .py-script, .queue-content pre.py-script, .call-cmd, .queue-content pre.call-cmd { max-height: calc(7.25em + 22px); overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .py-script { border-left: 3px solid rgba(55, 118, 171, 0.7); }
   .copy-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 2px 0 8px; }
   .copy-meta { margin-left: auto; }
   .copy-btn { font-size: 11.5px; padding: 3px 8px; }
@@ -2313,7 +2314,8 @@ function renderPythonScript(script) {
 // copy-button line.
 function renderCallBody(req, target, key, meta = '') {
   const command = target === req ? formatArgs(req) : target.command;
-  const body = isPython(target) ? renderPythonScript(target.python_script) : `<pre>${esc(command)}</pre>`;
+  // Long commands are clipped like Python scripts; the copy buttons hold the full text.
+  const body = isPython(target) ? renderPythonScript(target.python_script) : `<pre class="call-cmd">${esc(command)}</pre>`;
   const buttons = [copyBtn(key + '-cmd', 'Copy command', command)];
   if (isPython(target)) buttons.push(copyBtn(key + '-py', 'Copy script', target.python_script));
   if (target !== req) buttons.push(copyBtn(key + '-full', 'Copy full command', formatArgs(req)));
