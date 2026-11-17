@@ -1658,9 +1658,12 @@ UI_HTML = """<!doctype html>
   .hu[hidden] { display: none; }
   .hu-meter { flex: none; position: relative; width: 116px; height: 26px; border-radius: 6px; background: #21262d; border: 1px solid var(--border); overflow: hidden; cursor: pointer; }
   .hu-meter:hover { border-color: #8b949e; }
-  .hu-pop { position: fixed; z-index: 40; width: min(720px, calc(100vw - 16px)); padding: 12px 14px 4px; background: var(--bg); border: 1px solid #8b949e; border-radius: 8px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5); pointer-events: none; }
+  /* Only the usage table is shown, framed like a popover. */
+  .hu-pop { position: fixed; z-index: 40; width: min(720px, calc(100vw - 16px)); pointer-events: none; }
   .hu-pop[hidden] { display: none; }
-  .hu-pop .u-provider { margin-bottom: 8px; }
+  .hu-pop .u-provider { margin-bottom: 0; }
+  .hu-pop .u-provider > .panel-title { display: none; }
+  .hu-pop .u-card { margin: 0; border-color: #8b949e; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5); }
   .hu-meter > span { position: absolute; top: 0; bottom: 0; }
   .hu-fill { left: 0; background: var(--u); opacity: 0.45; }
   .hu-over { background: #f85149; opacity: 0.55; }
@@ -2398,6 +2401,18 @@ for (const ev of ['mousemove', 'mousedown', 'wheel', 'keydown', 'touchstart']) {
   document.addEventListener(ev, noteActivity, { capture: true, passive: true });
 }
 
+// Keyboard shortcut: Shift+A (outside text fields) presses Accept on the
+// shown request, i.e. 12h for plain requests, once for Python scripts.
+document.addEventListener('keydown', e => {
+  if (e.code !== 'KeyA' || !e.shiftKey || e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
+  if (e.target.closest && e.target.closest('input, textarea, select, [contenteditable]')) return;
+  if (document.body.classList.contains('queue-hidden')) return;
+  const accept = document.querySelector('#queue-content button.approve');
+  if (!accept) return;
+  e.preventDefault();
+  accept.click();
+});
+
 function autoAction(req, target, subIndex) {
   if (req.status !== 'pending') return null;
   const base = req.id + '#' + (subIndex === null ? '' : subIndex);
@@ -2541,9 +2556,9 @@ function renderQueue() {
           <div class="card">
             <div class="card-head">
               <div><span class="pill ${esc(rt)}">${esc(rt)}</span> ${toolLabel(req, sc)} <span class="pill">step ${sc.index + 1}/${req.subcommands.length}</span>${stalePill}</div>
-              <div class="meta">${renderAutoDecide(auto)}</div>
+              <div class="meta">${renderAutoDecide(auto)}<span>${esc(req.created_at)}</span></div>
             </div>
-            ${renderCallBody(req, sc, 'q-' + req.id + '-' + sc.index, `<span>${esc(cwd)}</span><span>${esc(req.created_at)}</span>`)}
+            ${renderCallBody(req, sc, 'q-' + req.id + '-' + sc.index, `<span>${esc(cwd)}</span>`)}
             <details class="full-cmd-box" ${openScripts.has('full-' + req.id) ? 'open' : ''} ontoggle="if (this.open) openScripts.add('full-${esc(req.id)}'); else openScripts.delete('full-${esc(req.id)}')"><summary>Full command</summary><pre>${esc(formatArgs(req))}</pre></details>
             ${renderReviewBox(sc.review)}
             ${tokenBar}
@@ -2572,9 +2587,9 @@ function renderQueue() {
       <div class="card">
         <div class="card-head">
           <div><span class="pill ${esc(rt)}">${esc(rt)}</span> ${toolLabel(req)}${stalePill}</div>
-          <div class="meta">${renderAutoDecide(auto)}</div>
+          <div class="meta">${renderAutoDecide(auto)}<span>${esc(req.created_at)}</span></div>
         </div>
-        ${renderCallBody(req, req, 'q-' + req.id, `<span>${esc(cwd)}</span><span>${esc(req.created_at)}</span>`)}
+        ${renderCallBody(req, req, 'q-' + req.id, `<span>${esc(cwd)}</span>`)}
         ${renderReviewBox(req.review)}
         ${tokenBar}
         <div class="actions">
