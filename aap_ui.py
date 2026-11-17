@@ -261,6 +261,15 @@ def extract_python_c_script(command: str) -> str | None:
     return tokens[2]
 
 
+def is_reviewable_python_script(script: str | None) -> bool:
+    return script is not None and (len(script.splitlines()) > 3 or len(script) > 200)
+
+
+def extract_reviewable_python_script(command: str) -> str | None:
+    script = extract_python_c_script(command)
+    return script if is_reviewable_python_script(script) else None
+
+
 def _split_word_segments(word: str) -> list[str]:
     """Split /paths and http(s)://URLs into slash-prefixed segments."""
     if word.startswith(("http://", "https://")):
@@ -470,7 +479,7 @@ class Rule:
     def matches(self, tool: str, arguments: dict[str, Any]) -> bool:
         command = arguments.get("command") or arguments.get("CommandLine")
         if (self.action == "allow" and isinstance(command, str)
-                and extract_python_c_script(command) is not None):
+                and extract_reviewable_python_script(command) is not None):
             return False
         if self.is_expired():
             return False
@@ -768,6 +777,10 @@ class ApprovalHub:
         for item in items:
             if not isinstance(item, dict) or not item.get("id"):
                 continue
+            for target in [item, *(item.get("subcommands") or [])]:
+                if target.get("python_script") is not None and not is_reviewable_python_script(target["python_script"]):
+                    target["python_script"] = None
+                    target.pop("review", None)
             item.setdefault("in_queue", True)
             item.setdefault("deadline_ts", time.monotonic() + parse_timeout_seconds(item.get("timeout")))
             self._requests[item["id"]] = item
@@ -805,6 +818,7 @@ class ApprovalHub:
     def create_request(
         self, payload: dict[str, Any], idempotency_key: str
     ) -> tuple[dict[str, Any], int]:
+        received_at = time.time()
         canonical = json.dumps(payload, sort_keys=True)
         tool = str(payload.get("tool") or "")
         arguments = payload.get("arguments")
@@ -862,7 +876,7 @@ class ApprovalHub:
                             "status": sc_status,
                             "command_tokens": sc_tokens,
                             "command_prefixes": sc_prefixes,
-                            "python_script": extract_python_c_script(sc),
+                            "python_script": extract_reviewable_python_script(sc),
                             "review": None,
                             "rule_id": sc_rule.id if sc_rule else None,
                         }
@@ -931,13 +945,32 @@ class ApprovalHub:
                 "command_tokens": cmd_tokens,
                 "command_prefixes": cmd_prefixes,
                 "subcommands": subcommands,
-                "python_script": extract_python_c_script(cmd_str) if (has_cmd and not subcommands) else None,
+                "python_script": extract_reviewable_python_script(cmd_str) if (has_cmd and not subcommands) else None,
                 "path_mode": path_mode,
                 "review": None,
                 "in_queue": status == "pending",
             }
+            python_targets = [
+                target for target in [record, *subcommands]
+                if target.get("python_script") is not None and target["status"] == "pending"
+            ]
+            if status == "pending" and python_targets:
+                record["ui_visible_after"] = received_at + 10.0
+                reveal = threading.Timer(
+                    max(0.0, record["ui_visible_after"] - time.time()),
+                    lambda: self._reveal_request(req_id),
+                )
+                reveal.daemon = True
+                reveal.start()
             self._requests[req_id] = record
             self._idempotency[idempotency_key] = (canonical, req_id)
+            if status == "pending":
+                if subcommands:
+                    for sc in subcommands:
+                        if sc["status"] == "pending" and sc.get("python_script") is not None:
+                            self.review_request(req_id, sub_index=sc["index"])
+                elif record["python_script"] is not None:
+                    self.review_request(req_id)
             if status in TERMINAL_STATUSES:
                 self._history.appendleft(req_id)
             else:
@@ -945,6 +978,12 @@ class ApprovalHub:
             self._cond.notify_all()
             self._notify_ui()
             return self._public_view(record), HTTPStatus.CREATED
+
+    def _reveal_request(self, req_id: str) -> None:
+        with self._cond:
+            record = self._requests.get(req_id)
+            if record is not None and record.get("in_queue"):
+                self._notify_ui()
 
     def _check_expiry(self, record: dict[str, Any]) -> None:
         if record["status"] == "pending" and time.monotonic() >= record["deadline_ts"]:
@@ -1010,9 +1049,8 @@ class ApprovalHub:
                 else record.get("python_script") is not None
                     or any(sc.get("python_script") is not None for sc in subcommands)
             )
-            # One-time (python -c) calls create no rule unless the user
-            # explicitly asks to remember the exact call ("exact" -> 12h TTL).
-            if decision_status == "approved" and (not one_time or allow_always == "exact"):
+            # Long Python scripts never create approval rules.
+            if decision_status == "approved" and not one_time:
                 tool = record["tool"]
                 args = (
                     {"command": target_sub["command"]}
@@ -1178,6 +1216,9 @@ class ApprovalHub:
                 "agent_reason": agent_why,
             }
             review_cmd = [*self.review_cmd, "--agent", agent]
+            cwd = str((record.get("context") or {}).get("cwd") or "")
+            if cwd:
+                review_cmd += ["--cwd", cwd]
             self._notify_ui()
 
         def _finish() -> None:
@@ -1191,6 +1232,12 @@ class ApprovalHub:
                     "agent": agent,
                     "agent_reason": agent_why,
                 }
+                python_targets = [
+                    entry for entry in [record, *(record.get("subcommands") or [])]
+                    if entry.get("python_script") is not None and entry["status"] == "pending"
+                ]
+                if all((entry.get("review") or {}).get("status") == "done" for entry in python_targets):
+                    record["ui_visible_after"] = 0.0
                 self._save_queue()
                 self._notify_ui()
 
@@ -1262,6 +1309,10 @@ class ApprovalHub:
                 self._public_view(r)
                 for r in self._requests.values()
                 if r.get("in_queue", r["status"] == "pending")
+                and (
+                    r["status"] != "pending"
+                    or time.time() >= r.get("ui_visible_after", 0.0)
+                )
             ]
             pending.sort(key=lambda r: r["created_at"])
             history = [
@@ -1365,7 +1416,7 @@ UI_HTML = """<!doctype html>
   }
   * { box-sizing: border-box; }
   body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); }
-  header { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--card); position: sticky; top: 0; z-index: 10; }
+  header { display: flex; align-items: center; justify-content: flex-start; gap: 20px; padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--card); position: sticky; top: 0; z-index: 10; }
   header h1 { margin: 0; font-size: 16px; display: flex; align-items: center; gap: 10px; }
   .badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #21262d; color: var(--muted); }
   .badge.pending { background: rgba(210, 153, 34, 0.2); color: var(--amber); }
@@ -1397,6 +1448,7 @@ UI_HTML = """<!doctype html>
   @media (max-width: 640px) {
     header { flex-direction: column; align-items: flex-start; gap: 10px; padding: 12px 16px; }
     .tabs { flex-wrap: wrap; }
+    .hu { margin-left: 0; max-width: 100%; }
     .queue-content input.reason { min-width: 140px; }
   }
   .panel-title { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 10px; display: flex; align-items: center; justify-content: space-between; }
@@ -1405,6 +1457,10 @@ UI_HTML = """<!doctype html>
   .rule-card { background: #1c2128; border-color: #363d46; transition: border-color 0.1s, background 0.1s; }
   .rule-card .card-head { display: flow-root; margin-bottom: 0; }
   .rule-card .card-head > div:last-child { line-height: 1.65; }
+  /* Approved (12h TTL): long commands are cut to 7 lines (full text in the tooltip). */
+  .ttl-row { display: flex; align-items: flex-start; gap: 6px; }
+  .ttl-row .pill { flex: none; }
+  code.ttl-code { display: block; min-width: 0; max-height: calc(7 * 1.65em + 4px); overflow: hidden; }
   .rule-card .btn-group { float: right; margin: 0 0 -3px 12px; }
   .rule-card .action-icon { margin-right: 6px; position: relative; top: 2px; }
   .rule-card:hover { border-color: #58a6ff; background: #232a35; }
@@ -1495,6 +1551,20 @@ UI_HTML = """<!doctype html>
   .u-when { color: var(--muted); font-size: 11.5px; margin-left: 6px; }
   .u-alert { font-size: 11.5px; text-transform: none; letter-spacing: 0; color: #ffa198; background: rgba(218, 54, 51, 0.16); border: 1px solid rgba(248, 81, 73, 0.35); border-radius: 999px; padding: 1px 8px; }
   .u-heading { margin-bottom: 16px; }
+  /* Header usage strip: one meter per model group. */
+  header h1, header .tabs { flex: none; white-space: nowrap; }
+  .hu { margin-left: auto; display: flex; align-items: center; gap: 8px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  .hu[hidden] { display: none; }
+  .hu-meter { flex: none; position: relative; width: 116px; height: 26px; border-radius: 6px; background: #21262d; border: 1px solid var(--border); overflow: hidden; cursor: pointer; }
+  .hu-meter:hover { border-color: #8b949e; }
+  .hu-meter > span { position: absolute; top: 0; bottom: 0; }
+  .hu-fill { left: 0; background: var(--u); opacity: 0.45; }
+  .hu-over { background: #f85149; opacity: 0.55; }
+  .hu-mark { width: 1px; background: #e6edf3; opacity: 0.25; }
+  .hu-meter > .hu-text { left: 0; right: 0; display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 0 8px; font-size: 12px; font-weight: 600; white-space: nowrap; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8); font-variant-numeric: tabular-nums; }
+  .hu-text small { font-weight: 400; color: var(--muted); }
+  .hu-warn { color: var(--amber); }
+  .hu .u-track { height: 6px; border-radius: 3px; }
   @media (max-width: 640px) {
     /* Model names move to a row above their windows; Pace and dates go. */
     .u-cell { padding-left: 10px; padding-right: 10px; }
@@ -1513,6 +1583,9 @@ UI_HTML = """<!doctype html>
   .test-result { padding: 10px 12px; border-radius: 6px; border: 1px solid var(--border); display: flex; flex-direction: column; gap: 6px; }
   .test-result.approved { border-color: rgba(63, 185, 80, 0.6); background: rgba(63, 185, 80, 0.08); }
   .test-result.denied { border-color: rgba(248, 81, 73, 0.6); background: rgba(248, 81, 73, 0.08); }
+  .verdict-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  .auto-decide { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .auto-decide button { padding: 2px 10px; font-size: 12px; font-weight: 400; }
   .full-cmd-box { margin: 8px 0; padding: 8px 10px; background: rgba(110, 118, 129, 0.08); border: 1px dashed var(--border); border-radius: 6px; }
   .full-cmd-box summary { cursor: pointer; font-size: 11.5px; font-weight: 600; color: var(--muted); user-select: none; }
   .full-cmd-box pre { margin: 6px 0 0; max-height: 180px; overflow-y: auto; opacity: 0.9; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -1520,17 +1593,18 @@ UI_HTML = """<!doctype html>
 </head>
 <body>
 <header>
-  <h1>AAP Approval Queue <span id="pending-count" class="badge">0 pending</span></h1>
+  <h1>AAP Approval Queue</h1>
   <div class="tabs">
     <button class="tab active" data-tab="live">Rules</button>
     <button class="tab" data-tab="history">History</button>
     <button class="tab" data-tab="usage">AI usage</button>
   </div>
+  <div id="header-usage" class="hu" aria-label="AI usage" hidden></div>
 </header>
 <main id="app"></main>
 <section id="queue-panel" class="queue-panel" aria-labelledby="queue-title">
   <div class="queue-inner">
-    <h2 id="queue-title" class="panel-title"><span><span id="queue-label">Nothing to review</span> <span id="queue-count" class="badge pending" hidden></span></span>
+    <h2 id="queue-title" class="panel-title"><span id="queue-label">Nothing to review</span>
       <span id="queue-nav" class="queue-nav" hidden>
         <button id="queue-prev" class="ghost" onclick="queueStep(-1)" title="Previous request" aria-label="Previous request">&lsaquo;</button>
         <span id="queue-pos" aria-live="polite"></span>
@@ -1557,6 +1631,7 @@ function reasonInputId(requestId, subIndex = null) {
 document.getElementById('queue-content').addEventListener('input', event => {
   if (event.target.matches('input.reason')) {
     reasonDrafts.set(event.target.id, event.target.value);
+    cancelAutoDecideForInput(event.target.id);
   }
 });
 
@@ -1567,12 +1642,12 @@ let testResult = null;
 let testRunning = false;
 
 // Shared verdict box for /test and the queue's Review button.
-function renderVerdict(decision, reason, stage, extra = '', explanation = '') {
+function renderVerdict(decision, reason, stage, extra = '', explanation = '', headExtra = '') {
   const ok = decision === 'approved';
   return `
     <div class="test-result ${ok ? 'approved' : 'denied'}">
-      <div><strong class="status-${esc(decision)}">${ok ? 'ACCEPTED' : 'REJECTED'}</strong>
-        <span class="pill">${esc(stage || '')}</span></div>
+      <div class="verdict-head"><span><strong class="status-${esc(decision)}">${ok ? 'ACCEPTED' : 'REJECTED'}</strong>
+        <span class="pill">${esc(stage || '')}</span></span>${headExtra}</div>
       ${explanation ? `<div><strong>Script:</strong> ${esc(explanation)}</div>` : ''}
       ${reason ? `<div>${esc(reason)}</div>` : ''}
       ${extra}
@@ -1658,7 +1733,65 @@ async function fetchUsage() {
   } catch (e) {
     usage = { error: String(e), interval: usage ? usage.interval : 30 };
   }
+  renderHeaderUsage();
   if (activeTab === 'usage') render();
+}
+
+// Header strip: one meter per model group, side by side, with the name and
+// percentage inside it. Each meter shows the group's window furthest ahead
+// of its expected usage; the full table lives in the AI usage tab.
+let headerUsageMarkup = null;
+const HEADER_USAGE_SHORT = { 'Claude and GPT': 'Cl+GPT', 'Gemini 4 Argon': 'Argon' };
+
+function huMeter(key, name, w, fallback, tip) {
+  const open = `<div class="hu-meter u-${esc(key)}" title="${esc(tip)}" onclick="historyRuleFilter = null; setTab('usage')">`;
+  if (!w || w.used_percent == null) {
+    return open + `<span class="hu-text"><span>${esc(name)}</span><span class="u-dim">n/a</span></span></div>`;
+  }
+  const clamp = v => Math.max(0, Math.min(100, v));
+  const used = clamp(w.used_percent);
+  const pace = w.expected_percent == null ? null : clamp(w.expected_percent);
+  const onTime = pace == null ? used : Math.min(used, pace);
+  const cls = w.used_percent >= 80 ? 'u-red' : (pace != null && used > pace ? 'hu-warn' : '');
+  return open +
+    `<span class="hu-fill" style="width:${onTime}%"></span>` +
+    (used > onTime ? `<span class="hu-over" style="left:${onTime}%;width:${used - onTime}%"></span>` : '') +
+    (pace != null ? `<span class="hu-mark" style="left:${pace}%"></span>` : '') +
+    `<span class="hu-text"><span>${esc(name)}${fallback ? ` <small>${esc(fallback)}</small>` : ''}</span>` +
+    `<span class="${cls}">${w.used_percent}%</span></span></div>`;
+}
+
+function renderHeaderUsage() {
+  const el = document.getElementById('header-usage');
+  const data = usage && usage.data;
+  const items = [];
+  for (const [key, p] of Object.entries((data && data.providers) || {})) {
+    if (p.error) {
+      items.push(huMeter(key, p.name, null, '', p.name + ': ' + p.error));
+      continue;
+    }
+    const groups = (p.groups || []).filter(g => (g.windows || []).length);
+    for (const g of groups) {
+      const full = groups.length === 1 || g.name === 'All models' ? p.name : g.name.replace(/ +models$/i, '');
+      const name = HEADER_USAGE_SHORT[full] || full;
+      const tip = [p.name + (name === p.name ? '' : ' · ' + g.name)].concat(g.windows.map(w => {
+        if (w.used_percent == null) return `${w.label}: unavailable`;
+        let t = `${w.label}: ${w.used_percent}% used`;
+        if (w.expected_percent != null) t += `, pace ${w.expected_percent}%`;
+        if (w.reset) t += `, resets ${fmtIn(w.reset)} (${fmtWhen(w.reset)})`;
+        return t;
+      })).join('\\n');
+      // The window furthest ahead of its expected usage, labelled 5h/7d.
+      const over = x => x.used_percent == null ? -Infinity : x.used_percent - (x.expected_percent ?? x.used_percent);
+      const w = g.windows.reduce((a, b) => (over(b) > over(a) ? b : a));
+      items.push(huMeter(key, name, w, w.label === 'Weekly' ? '7d' : w.label, tip));
+    }
+  }
+  const markup = items.join('');
+  if (markup === headerUsageMarkup) return;
+  headerUsageMarkup = markup;
+  el.innerHTML = markup;
+  el.hidden = !markup;
 }
 
 function fmtReset(iso) {
@@ -2024,7 +2157,7 @@ function renderReviewBtn(reqId, target, subIndex = null) {
   return `<button class="review-btn" ${disabled} onclick="startReview('${esc(reqId)}', ${subArg})">${label}</button>`;
 }
 
-function renderReviewBox(review) {
+function renderReviewBox(review, reqId = null, subIndex = null) {
   if (!review) return '';
   const by = review.agent ? ` by ${review.agent}` : '';
   if (review.status === 'running') {
@@ -2032,19 +2165,113 @@ function renderReviewBox(review) {
   }
   if (!review.decision) return `<div class="review-box">🔎 ${esc(review.summary || review.status)}</div>`;
   return renderVerdict(review.decision, review.deny_reason ?? (review.explanation ? '' : review.summary), 'review' + by,
-    review.agent_reason ? `<div class="meta">${esc(review.agent_reason)}</div>` : '', review.explanation);
+    review.agent_reason ? `<div class="meta">${esc(review.agent_reason)}</div>` : '', review.explanation,
+    reqId === null ? '' : renderAutoDecide(reqId, subIndex, review));
 }
 
-// python -c scripts get "Accept (12h)" (exact-call rule) and a one-time
-// "Approve"; everything else keeps the single 12h "Accept".
+// A finished review's verdict is applied automatically AUTO_DECIDE_MS after
+// this page first shows it (so a page opened later never decides at once),
+// unless the user cancels it, edits the reason, or decides first. The
+// countdown text is filled in by autoDecideTick().
+const AUTO_DECIDE_MS = 30000;
+const autoCancelled = new Set();
+const autoFired = new Set();
+const autoDeadlines = new Map();  // key -> ms timestamp
+
+function autoDeadline(key) {
+  if (!autoDeadlines.has(key)) autoDeadlines.set(key, Date.now() + AUTO_DECIDE_MS);
+  return autoDeadlines.get(key);
+}
+
+function autoDecideKey(reqId, subIndex, review) {
+  return reqId + '#' + (subIndex === null ? '' : subIndex) + '@' + review.finished_at;
+}
+
+function autoDecideTarget(review) {
+  return review && review.status === 'done' && review.decision && review.finished_at
+    && !isNaN(Date.parse(review.finished_at));
+}
+
+function renderAutoDecide(reqId, subIndex, review) {
+  if (!autoDecideTarget(review)) return '';
+  const key = autoDecideKey(reqId, subIndex, review);
+  if (autoCancelled.has(key)) return '<span class="auto-decide u-dim">Auto-decision cancelled</span>';
+  const verb = review.decision === 'approved' ? 'Auto-accept' : 'Auto-deny';
+  const deadline = autoDeadline(key);
+  return `<span class="auto-decide ${review.decision === 'approved' ? 'status-approved' : 'status-denied'}">` +
+    `<span class="auto-count" data-deadline="${deadline}" data-verb="${verb}"></span>` +
+    `<button class="ghost" onclick="cancelAutoDecide('${esc(key)}')">Cancel</button></span>`;
+}
+
+function cancelAutoDecide(key) {
+  autoCancelled.add(key);
+  queueMarkup = null;  // force the queue to re-render without the countdown
+  render();
+}
+
+// Typing in a card's reason box cancels that card's pending auto-decision.
+function cancelAutoDecideForInput(inputId) {
+  for (const t of autoDecideTargets()) {
+    if (reasonInputId(t.reqId, t.subIndex) === inputId && !autoCancelled.has(t.key)) cancelAutoDecide(t.key);
+  }
+}
+
+function autoDecideTargets() {
+  const out = [];
+  for (const req of state.pending) {
+    const subs = (req.subcommands || []).filter(sc => sc.status === 'pending');
+    const items = subs.length ? subs.map(sc => [sc, sc.index]) : [[req, null]];
+    for (const [target, subIndex] of items) {
+      const review = target.review;
+      if (!autoDecideTarget(review)) continue;
+      const key = autoDecideKey(req.id, subIndex, review);
+      out.push({ reqId: req.id, subIndex, review, key, deadline: autoDeadline(key) });
+    }
+  }
+  return out;
+}
+
+function updateAutoCounts(now = Date.now()) {
+  for (const el of document.querySelectorAll('.auto-count')) {
+    const left = Math.max(0, Math.ceil((Number(el.dataset.deadline) - now) / 1000));
+    el.textContent = `${el.dataset.verb} in ${left}s`;
+  }
+}
+
+async function autoDecideTick() {
+  const now = Date.now();
+  updateAutoCounts(now);
+  for (const t of autoDecideTargets()) {
+    if (now < t.deadline || autoCancelled.has(t.key) || autoFired.has(t.key)) continue;
+    autoFired.add(t.key);
+    const approved = t.review.decision === 'approved';
+    const inputId = reasonInputId(t.reqId, t.subIndex);
+    const input = document.getElementById(inputId);
+    const typed = input ? input.value : (reasonDrafts.get(inputId) || '');
+    const by = t.review.agent ? ` by ${t.review.agent}` : '';
+    const reason = approved
+      ? `Auto-accepted after review${by}`
+      : (typed || t.review.deny_reason || t.review.summary || `Auto-denied after review${by}`);
+    try {
+      await fetch('/api/ui/requests/' + encodeURIComponent(t.reqId) + '/decision', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision: approved ? 'approved' : 'denied', reason, allow_always: null, prefix: '', sub_index: t.subIndex }),
+      });
+    } catch (e) {}
+    await fetchState();
+  }
+}
+setInterval(autoDecideTick, 500);
+
+// Long Python scripts are accepted once; ordinary commands keep 12h acceptance.
 function renderApproveActions(reqId, target, subIndex = null) {
   const id = esc(reqId);
   const subArg = subIndex === null ? 'null' : subIndex;
-  if (target.python_script == null) {
-    return `<button class="approve" onclick="decide('${id}','approved',null,'',${subArg})" title="Accept exact call for 12h">Accept</button>`;
-  }
-  return `<button class="approve" onclick="decide('${id}','approved','exact','',${subArg})" title="Accept exact call for 12h">Accept (12h)</button>`
-    + `<button class="approve" onclick="decide('${id}','approved',null,'',${subArg})" title="Approve once">Approve</button>`;
+  const python = target.python_script != null;
+  const allowAlways = python ? 'null' : "'exact'";
+  const title = python ? 'Accept this script once' : 'Accept exact call for 12h';
+  return `<button class="approve" onclick="decide('${id}','approved',${allowAlways},'',${subArg})" title="${title}">Accept</button>`;
 }
 
 // When the reviewer suggests denial, pre-fill only the actionable deny reason.
@@ -2083,7 +2310,7 @@ function renderQueue() {
             </div>
             ${renderCallBody(req, sc, 'q-' + req.id + '-' + sc.index)}
             <details class="full-cmd-box" ${openScripts.has('full-' + req.id) ? 'open' : ''} ontoggle="if (this.open) openScripts.add('full-${esc(req.id)}'); else openScripts.delete('full-${esc(req.id)}')"><summary>Full command</summary><pre>${esc(formatArgs(req))}</pre></details>
-            ${renderReviewBox(sc.review)}
+            ${renderReviewBox(sc.review, req.id, sc.index)}
             ${tokenBar}
             <div class="actions">
               ${approveAction}
@@ -2112,7 +2339,7 @@ function renderQueue() {
           <div class="meta"><span>${esc(cwd)}</span><span>${esc(req.created_at)}</span></div>
         </div>
         ${renderCallBody(req, req, 'q-' + req.id)}
-        ${renderReviewBox(req.review)}
+        ${renderReviewBox(req.review, req.id)}
         ${tokenBar}
         <div class="actions">
           ${approveAction}
@@ -2286,7 +2513,7 @@ function renderRules() {
         <div class="card rule-card${highlightedRuleId === r.id ? ' rule-highlight' : ''}" id="rule-${esc(r.id)}">
           <div class="card-head">
             <div class="btn-group">${hitsLink(r)}<button class="del-btn icon-btn" onclick="deleteRule('${esc(r.id)}')" title="Delete" aria-label="Delete">${ICON_TRASH}</button></div>
-            <div><span class="pill">${esc(ttl)}</span> <code class="rule-code">${esc(desc)}</code></div>
+            <div class="ttl-row"><span class="pill">${esc(ttl)}</span><code class="rule-code ttl-code" title="${esc(desc)}">${esc(desc)}</code></div>
           </div>
         </div>`;
     }).join('') + `</section>`;
@@ -2299,19 +2526,13 @@ function render() {
     const subs = (req.subcommands || []).filter(sc => sc.status === 'pending');
     return acc + (subs.length ? subs.length : 1);
   }, 0);
-  const pc = document.getElementById('pending-count');
-  pc.textContent = pendingCount + ' pending';
-  pc.className = 'badge' + (pendingCount ? ' pending' : '');
   document.title = (pendingCount ? '(' + pendingCount + ') ' : '') + 'AAP Approval Queue';
   setFavicon(pendingCount > 0);
   const queueContent = document.getElementById('queue-content');
   queueContent.hidden = pendingCount === 0;
   document.body.classList.toggle('has-queue', pendingCount > 0);
   document.body.classList.toggle('queue-hidden', activeTab === 'test');
-  document.getElementById('queue-label').textContent = pendingCount ? 'Queue' : 'Nothing to review';
-  const queueCount = document.getElementById('queue-count');
-  queueCount.hidden = pendingCount === 0;
-  queueCount.textContent = '(' + pendingCount + ')';
+  document.getElementById('queue-label').textContent = pendingCount ? 'Approval Request' : 'Nothing to review';
   const cards = renderQueue();
   const idx = currentQueueIndex(cards);
   const nav = document.getElementById('queue-nav');
@@ -2333,6 +2554,7 @@ function render() {
     const sameCard = queueContent.dataset.key === (queueKey || '');
     const scrollTop = sameCard ? queueContent.scrollTop : 0;
     queueContent.innerHTML = markup;
+    updateAutoCounts();
     queueContent.dataset.key = queueKey || '';
     const remaining = liveInputIds;
     for (const input of queueContent.querySelectorAll('input.reason')) {
@@ -2432,7 +2654,10 @@ ev.onmessage = () => fetchState();
 setInterval(fetchState, 5000);
 // The server refetches at most every 30 s; polling often only picks up
 // a finished refresh sooner.
-setInterval(() => { if (activeTab === 'usage') fetchUsage(); }, 3000);
+// The usage tab polls every 3s; elsewhere every 15s for the header strip.
+let usageTick = 0;
+setInterval(() => { if (activeTab === 'usage' || ++usageTick % 5 === 0) fetchUsage(); }, 3000);
+fetchUsage();
 
 // The queue panel's height follows its card; keep the page's bottom padding
 // equal to it so nothing hides behind the fixed panel.

@@ -1,6 +1,9 @@
 from pathlib import Path
 import tempfile
+import shlex
 import unittest
+import time
+from unittest.mock import patch
 
 import aap_ui
 
@@ -9,7 +12,27 @@ class ShellPolicyTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        reviewer = patch("aap_ui.run_python_review", return_value={
+            "decision": "approved", "explanation": "Prints a value.", "deny_reason": "",
+        })
+        reviewer.start()
+        self.addCleanup(reviewer.stop)
+        self.addCleanup(self.wait_for_reviews)
         self.hub = aap_ui.ApprovalHub(aap_ui.RuleStore(Path(tmp.name) / "rules.json"))
+
+    def wait_for_reviews(self):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with self.hub._cond:
+                targets = [
+                    target
+                    for record in self.hub._requests.values()
+                    for target in [record, *(record.get("subcommands") or [])]
+                ]
+                if not any((target.get("review") or {}).get("status") == "running" for target in targets):
+                    return
+            time.sleep(0.01)
+        self.fail("Background reviews did not finish")
 
     def request(self, command):
         record, _ = self.hub.create_request(
@@ -90,7 +113,8 @@ class ShellPolicyTests(unittest.TestCase):
             self.hub.rules.add_rule(aap_ui.Rule(
                 id=kind, kind=kind, tool="Bash", action="allow", prefix=prefix
             ))
-        for command in ("python3 -c 'print(1)'", "FOO=bar python3 -c 'print(1)'"):
+        for command in ("python3 -c " + shlex.quote("print(1)\n# line 2\n# line 3\n# line 4"),
+                        "FOO=bar python3 -c " + shlex.quote("print(1)\n# line 2\n# line 3\n# line 4")):
             with self.subTest(command=command):
                 record = self.request(command)
                 self.assertEqual(record["status"], "pending")

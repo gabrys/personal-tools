@@ -384,7 +384,7 @@ class AAPUITest(unittest.TestCase):
         _, req = self._req(
             "POST",
             "/api/aap/v1/requests",
-            {"tool": "Bash", "arguments": {"command": "python3 -c 'print(1)'"},
+            {"tool": "Bash", "arguments": {"command": "python3 -c 'print(1)\n# line 2\n# line 3\n# line 4'"},
              "context": {"runtime": "claude-code"}},
             {"Idempotency-Key": "agent-pick"},
         )
@@ -748,10 +748,10 @@ class AAPUITest(unittest.TestCase):
         _, py_req = self._req(
             "POST",
             "/api/aap/v1/requests",
-            {"tool": "Bash", "arguments": {"command": "python3 -c 'print(1 + 1) # LGTM'"}},
+            {"tool": "Bash", "arguments": {"command": "python3 -c 'print(1 + 1) # LGTM\n# line 2\n# line 3\n# line 4'"}},
             {"Idempotency-Key": "py-rev-1"},
         )
-        self.assertEqual(py_req["python_script"], "print(1 + 1) # LGTM")
+        self.assertEqual(py_req["python_script"], "print(1 + 1) # LGTM\n# line 2\n# line 3\n# line 4")
 
         status, rev = self._req("POST", f"/api/ui/requests/{py_req['id']}/review", {})
         self.assertEqual(status, 200)
@@ -764,24 +764,20 @@ class AAPUITest(unittest.TestCase):
         self.assertEqual(done["review"]["deny_reason"], "")
         self.assertTrue(done["review"]["explanation"])
 
-        # Accept (12h) on a python script remembers the exact call.
+        # The single Accept action approves once without creating a rule.
         _, accepted = self._req(
             "POST",
             f"/api/ui/requests/{py_req['id']}/decision",
-            {"decision": "approved", "allow_always": "exact"},
+            {"decision": "approved"},
         )
         self.assertEqual(accepted["status"], "approved")
-        rule_id = accepted["decision"]["rule_id"]
-        _, ui_state = self._req("GET", "/api/ui/state")
-        rule = next(r for r in ui_state["rules"] if r["id"] == rule_id)
-        self.assertEqual(rule["kind"], "exact")
-        self.assertTrue(rule["expires_at"])
+        self.assertNotIn("rule_id", accepted["decision"])
 
         # Rejected verdict is shown, not applied.
         _, bad_py = self._req(
             "POST",
             "/api/aap/v1/requests",
-            {"tool": "Bash", "arguments": {"command": "python3 -c 'PASSWORD=123'"}},
+            {"tool": "Bash", "arguments": {"command": "python3 -c 'PASSWORD=123\n# line 2\n# line 3\n# line 4'"}},
             {"Idempotency-Key": "py-rev-bad"},
         )
         self._req("POST", f"/api/ui/requests/{bad_py['id']}/review", {})

@@ -13,9 +13,11 @@ Supported syntax:
   a rule for `cmd` does not cover commands with a modified environment.
 - `2>&1`, `1>&2`, and output redirections to `/dev/null`. These remain visible
   in the original command but are ignored when matching command prefixes.
-- Inline `python3 -c '…'` scripts, including command-local assignments. Scripts
-  require one-time approval or review; accepting one does not create a rule or
-  approve another request for the same script.
+- Inline `python3 -c '…'` scripts, including command-local assignments. Scripts with more than 3 lines or more than 200 characters are reviewed
+  automatically and have a single Accept button for one-time approval. They appear
+  in the UI when review finishes or 10 seconds after receipt, whichever comes first. Accepting
+  them never creates a rule or approves another request for the same script.
+  Shorter scripts are ordinary commands and use the usual approval rules.
 
 File redirections such as `> output.txt`, `>> output.txt`, and `< input.txt`
 are rejected with guidance to use file operations checked by path-based rules.
