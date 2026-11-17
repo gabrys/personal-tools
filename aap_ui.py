@@ -1497,7 +1497,7 @@ UI_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>🛡️</title>
+<title>aap-ui</title>
 <link id="favicon" rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><path d='M16 2 4 6v9c0 7.5 5.1 13.4 12 15 6.9-1.6 12-7.5 12-15V6z' fill='%23238636'/><path d='m10 16 4 4 8-8' fill='none' stroke='%23fff' stroke-width='3.2' stroke-linecap='round' stroke-linejoin='round'/></svg>" />
 <style>
   :root {
@@ -2384,11 +2384,11 @@ function cancelAutoDecideForInput(inputId) {
   }
 }
 
-// Tab title: shield, the pending count and the running auto-action
-// countdown, e.g. "🛡️ (3) accept in 12s"; just the shield when idle.
+// Tab title: app name, the pending count and the running auto-action
+// countdown, e.g. "aap-ui (3) accept in 12s"; just the name when idle.
 let titlePending = 0;
 function updateTitle(now = Date.now()) {
-  const parts = ['🛡️'];
+  const parts = ['aap-ui'];
   if (titlePending) parts.push(`(${titlePending})`);
   if (autoCurrent) {
     const left = Math.max(0, Math.ceil((autoCurrent.deadline - now) / 1000));
