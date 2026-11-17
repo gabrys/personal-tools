@@ -964,6 +964,97 @@ class AAPUITest(unittest.TestCase):
         )
         self.assertEqual(req_w2["status"], "approved")
 
+    def test_deny_rule_from_token_carries_reason(self) -> None:
+        def create(cmd: str, key: str) -> dict:
+            _, rec = self._req("POST", "/api/aap/v1/requests",
+                               {"tool": "Bash", "arguments": {"command": cmd}}, {"Idempotency-Key": key})
+            return rec
+
+        first = create("git push --force origin main", "d1")
+        other = create("git push --force origin dev", "d2")
+        compound = create("ls && git push --force", "d3")
+        unrelated = create("git push origin main", "d4")
+        reason = "Use --force-with-lease instead."
+
+        _, dec = self._req("POST", f"/api/ui/requests/{first['id']}/decision", {
+            "decision": "denied", "reason": reason, "allow_always": "prefix", "prefix": "git push --force *",
+        })
+        self.assertEqual(dec["status"], "denied")
+        self.assertEqual(dec["decision"]["reason"], reason)
+        self.assertEqual(dec["decision"]["labels"], ["click", "new-rule"])
+        rules = self.hub.rules.list_rules()
+        self.assertEqual([(r["kind"], r["action"], r["prefix"], r["reason"]) for r in rules],
+                         [("command_prefix", "deny", "git push --force *", reason)])
+        self.assertEqual(dec["decision"]["rule_id"], rules[0]["id"])
+
+        # Pending requests the new rule governs are denied with its reason.
+        for rec in (other, compound):
+            _, now = self._req("GET", f"/api/aap/v1/requests/{rec['id']}")
+            self.assertEqual(now["status"], "denied")
+            self.assertEqual(now["decision"]["reason"], reason)
+        _, still = self._req("GET", f"/api/aap/v1/requests/{unrelated['id']}")
+        self.assertEqual(still["status"], "pending")
+
+        # New matching requests are denied with the reason too.
+        later = create("git push --force", "d5")
+        self.assertEqual(later["status"], "denied")
+        self.assertEqual(later["decision"]["reason"], reason)
+
+        # Editing the rule's reason changes what later matches report.
+        status, updated = self._req("PUT", f"/api/ui/rules/{rules[0]['id']}", {"reason": " Never force push. "})
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["reason"], "Never force push.")
+        self.assertEqual(create("git push --force x", "d6")["decision"]["reason"], "Never force push.")
+
+    def test_plain_deny_creates_no_rule_and_allow_rules_keep_generic_reason(self) -> None:
+        _, rec = self._req("POST", "/api/aap/v1/requests",
+                           {"tool": "Bash", "arguments": {"command": "rm -rf x"}}, {"Idempotency-Key": "p1"})
+        self._req("POST", f"/api/ui/requests/{rec['id']}/decision", {"decision": "denied", "reason": "no"})
+        self.assertEqual(self.hub.rules.list_rules(), [])
+        rule = aap_ui.Rule(id="a", kind="command_prefix", tool="Bash", action="allow", prefix="ls *", reason="x")
+        self.assertEqual(aap_ui.rule_decision_reason(rule), "Matched rule (command_prefix)")
+
+    def test_more_specific_rule_wins_and_deny_wins_ties(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = aap_ui.RuleStore(Path(tmp.name) / "rules.json")
+        store.add_rule(aap_ui.Rule(id="deny-git", kind="command_prefix", tool="Bash", action="deny",
+                                   prefix="git *", reason="Ask first."))
+        store.add_rule(aap_ui.Rule(id="allow-status", kind="command_prefix", tool="Bash", action="allow",
+                                   prefix="git status *"))
+        store.add_rule(aap_ui.Rule(id="allow-bash", kind="tool", tool="Bash", action="allow"))
+
+        def winner(cmd: str) -> str | None:
+            rule = store.match("Bash", {"command": cmd}, record_hit=False)
+            return rule.id if rule else None
+
+        self.assertEqual(winner("git status --short"), "allow-status")
+        self.assertEqual(winner("git log"), "deny-git")
+        self.assertEqual(winner("ls"), "allow-bash")
+        # A later allow that is no more specific still loses.
+        store.add_rule(aap_ui.Rule(id="allow-git-any", kind="command_prefix", tool="Bash", action="allow",
+                                   prefix="git * *"))
+        self.assertEqual(winner("git log -1"), "deny-git")
+        # Equal specificity: deny wins.
+        store.add_rule(aap_ui.Rule(id="allow-a", kind="path_prefix", tool="*", action="allow", prefix="/a/*", mode="ro"))
+        store.add_rule(aap_ui.Rule(id="deny-a", kind="path_prefix", tool="*", action="deny", prefix="/a/*", mode="rw"))
+        store.add_rule(aap_ui.Rule(id="allow-a2", kind="path_prefix", tool="*", action="allow", prefix="/a/*", mode="ro"))
+        self.assertEqual(store.match("Read", {"file_path": "/a/x"}, record_hit=False).id, "deny-a")
+
+    def test_rule_with_opposite_action_is_replaced(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = aap_ui.RuleStore(Path(tmp.name) / "rules.json")
+        store.add_rule(aap_ui.Rule(id="a", kind="command_prefix", tool="Bash", action="allow", prefix="git push *"))
+        store.add_rule(aap_ui.Rule(id="d", kind="command_prefix", tool="Bash", action="deny", prefix="git push *",
+                                   reason="No pushing."))
+        self.assertEqual([(r["id"], r["action"], r["reason"]) for r in store.list_rules()],
+                         [("d", "deny", "No pushing.")])
+        # Re-adding the same deny rule updates its reason.
+        store.add_rule(aap_ui.Rule(id="d2", kind="command_prefix", tool="Bash", action="deny", prefix="git push *",
+                                   reason="Ask first."))
+        self.assertEqual([(r["id"], r["reason"]) for r in store.list_rules()], [("d", "Ask first.")])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -468,6 +468,23 @@ SHELL_TOOLS = {"Bash", "run_command"}
 DECISION_LABELS = ["rule", "prior", "ai-review", "click", "lazy", "new-12h", "new-rule"]
 
 
+def rule_decision_reason(rule: "Rule") -> str:
+    if rule.action == "deny" and rule.reason.strip():
+        return rule.reason.strip()
+    return f"Matched rule ({rule.kind})"
+
+
+def rule_specificity(rule: "Rule") -> tuple[int, int]:
+    """How narrowly a rule targets calls: exact calls over prefix rules over
+    whole-tool rules, then by the literal (non-wildcard) length of the prefix,
+    so `git status *` (10) is more specific than `git *` (3)."""
+    if rule.kind == "exact":
+        return (2, 0)
+    if rule.kind in {"command_prefix", "path_prefix", "domain"}:
+        return (1, len(rule.prefix.replace("*", "").strip()))
+    return (0, 0 if rule.tool == "*" else 1)
+
+
 def rule_label(rule: "Rule") -> str:
     return "prior" if rule.kind == "exact" else "rule"
 
@@ -490,6 +507,7 @@ class Rule:
     created_at: str = field(default_factory=utc_now_iso)
     expires_at: str | None = None
     hits: int = 0
+    reason: str = ""  # deny rules: told to the agent instead of "Matched rule (...)"
 
     def is_expired(self, now: datetime | None = None) -> bool:
         if not self.expires_at:
@@ -550,6 +568,7 @@ class Rule:
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "hits": self.hits,
+            "reason": self.reason,
         }
 
     @classmethod
@@ -565,6 +584,7 @@ class Rule:
             created_at=str(data.get("created_at") or utc_now_iso()),
             expires_at=data.get("expires_at"),
             hits=int(data.get("hits") or 0),
+            reason=str(data.get("reason") or ""),
         )
 
 
@@ -607,15 +627,22 @@ class RuleStore:
             return [r.to_dict() for r in self._rules]
 
     def match(self, tool: str, arguments: dict[str, Any], record_hit: bool = True) -> Rule | None:
+        """The most specific matching rule wins; on equal specificity deny
+        beats allow, then the newest rule wins. So [deny `git *`] +
+        [allow `git status *`] allows `git status` but no other git command."""
         with self._lock:
             self._prune_expired_locked()
+            best: Rule | None = None
+            best_key: tuple[tuple[int, int], int] | None = None
             for rule in self._rules:
                 if rule.matches(tool, arguments):
-                    if record_hit:
-                        rule.hits += 1
-                        self._save()
-                    return rule
-        return None
+                    key = (rule_specificity(rule), 1 if rule.action == "deny" else 0)
+                    if best_key is None or key > best_key:
+                        best, best_key = rule, key
+            if best is not None and record_hit:
+                best.hits += 1
+                self._save()
+            return best
 
     @staticmethod
     def _superseded_by(existing: Rule, rule: Rule) -> bool:
@@ -642,18 +669,24 @@ class RuleStore:
                 self._rules.insert(0, rule)
                 self._save()
                 return rule
+            def same_target(r: Rule) -> bool:
+                return (
+                    r.kind == rule.kind
+                    and r.tool == rule.tool
+                    and r.prefix == rule.prefix
+                    and _rule_path_level(r) == _rule_path_level(rule)
+                    and r.arguments == rule.arguments
+                )
+
+            # The same rule with the opposite action is replaced.
+            self._rules = [r for r in self._rules if not (same_target(r) and r.action != rule.action)]
             # Avoid duplicate identical rules
             for existing in self._rules:
-                if (
-                    existing.kind == rule.kind
-                    and existing.tool == rule.tool
-                    and existing.action == rule.action
-                    and existing.prefix == rule.prefix
-                    and _rule_path_level(existing) == _rule_path_level(rule)
-                    and existing.arguments == rule.arguments
-                ):
+                if same_target(existing):
                     if rule.hits > 0:
                         existing.hits += rule.hits
+                    if rule.reason.strip():
+                        existing.reason = rule.reason.strip()
                         self._save()
                     return existing
             self._rules.insert(0, rule)
@@ -684,12 +717,15 @@ class RuleStore:
         prefix: str | None = None,
         arguments: dict[str, Any] | None = None,
         mode: str | None = None,
+        reason: str | None = None,
     ) -> Rule | None:
         with self._lock:
             for rule in self._rules:
                 if rule.id == rule_id:
                     if action in {"allow", "deny"}:
                         rule.action = action
+                    if isinstance(reason, str):
+                        rule.reason = reason.strip()
                     if prefix is not None and rule.kind in {"command_prefix", "path_prefix", "domain"}:
                         rule.prefix = prefix.strip()
                     if mode in {"ro", "rw"} and rule.kind == "path_prefix":
@@ -963,7 +999,7 @@ class ApprovalHub:
                     decision = {
                         "status": "denied",
                         "decided_at": now,
-                        "reason": f"Matched rule ({any_denied.kind})",
+                        "reason": rule_decision_reason(any_denied),
                         "rule_id": any_denied.id,
                         "labels": [rule_label(any_denied)],
                     }
@@ -988,7 +1024,7 @@ class ApprovalHub:
                     decision = {
                         "status": status,
                         "decided_at": now,
-                        "reason": f"Matched rule ({matched.kind})",
+                        "reason": rule_decision_reason(matched),
                         "rule_id": matched.id,
                         "labels": [rule_label(matched)],
                     }
@@ -1097,6 +1133,90 @@ class ApprovalHub:
                 self._check_expiry(record)
             return self._public_view(record)
 
+    def _rule_for_decision(
+        self,
+        record: dict[str, Any],
+        target_sub: dict[str, Any] | None,
+        action: str,
+        allow_always: str | None,
+        prefix: str,
+        reason: str = "",
+    ) -> Rule | None:
+        """The rule a UI decision creates: whole tool, domain, prefix, or
+        (allow only) this exact call for 12h."""
+        tool = record["tool"]
+        args = {"command": target_sub["command"]} if target_sub is not None else record["arguments"]
+        base = {"id": str(uuid.uuid4()), "tool": tool, "action": action, "hits": 1, "reason": reason}
+        if allow_always == "tool":
+            return Rule(kind="tool", **base)
+        if allow_always == "domain":
+            chosen = prefix.strip() or str(args.get("domain") or "").strip()
+            return Rule(kind="domain", prefix=chosen, **base) if chosen else None
+        if allow_always == "prefix":
+            chosen = prefix.strip() or (
+                record["suggested_prefixes"][0] if record["suggested_prefixes"] else ""
+            )
+            if not chosen:
+                return None
+            if "command" in args or "CommandLine" in args:
+                return Rule(kind="command_prefix", prefix=chosen, **base)
+            # A deny path rule blocks reads and writes alike.
+            mode = "rw" if action == "deny" else (_path_tool_level(tool) or "ro")
+            return Rule(kind="path_prefix", prefix=chosen, mode=mode, **{**base, "tool": "*"})
+        if action != "allow":
+            return None
+        # Plain Approve remembers this exact call with a 12h TTL
+        return Rule(kind="exact", arguments=args, expires_at=utc_after_iso(12 * 3600), **base)
+
+    def _apply_new_rule(
+        self, rule: Rule, record: dict[str, Any], target_sub: dict[str, Any] | None
+    ) -> None:
+        """Decide other pending requests (and steps) that the new rule now
+        governs, i.e. where it is the rule RuleStore.match picks."""
+
+        def governs(tool: str, arguments: dict[str, Any]) -> bool:
+            winner = self.rules.match(tool, arguments, record_hit=False)
+            return winner is not None and winner.id == rule.id
+
+        status = "approved" if rule.action == "allow" else "denied"
+        for other in self._requests.values():
+            if other["status"] != "pending":
+                continue
+            if status == "denied" and other is record:
+                continue  # decide_request denies it itself
+            other_subs = other.get("subcommands") or []
+            if other_subs:
+                hit = False
+                for sc in other_subs:
+                    if sc["status"] == "pending" and governs(other["tool"], {"command": sc["command"]}):
+                        sc["status"] = status
+                        sc["rule_id"] = rule.id
+                        sc["labels"] = [rule_label(rule)]
+                        hit = True
+                        if sc is not target_sub:
+                            self.rules.record_hit(rule.id)
+                if status == "approved" and all(sc["status"] == "approved" for sc in other_subs):
+                    labels = merge_labels(*(s.get("labels") for s in other_subs))
+                elif status == "denied" and hit:
+                    labels = [rule_label(rule)]
+                else:
+                    continue
+            elif other is not record and governs(other["tool"], other["arguments"]):
+                labels = [rule_label(rule)]
+                self.rules.record_hit(rule.id)
+            else:
+                continue
+            other["status"] = status
+            other["in_queue"] = False
+            other["decision"] = {
+                "status": status,
+                "decided_at": utc_now_iso(),
+                "reason": rule_decision_reason(rule),
+                "rule_id": rule.id,
+                "labels": labels,
+            }
+            self._add_history(other["id"])
+
     def decide_request(
         self,
         req_id: str,
@@ -1131,102 +1251,17 @@ class ApprovalHub:
                 else record.get("python_script") is not None
                     or any(sc.get("python_script") is not None for sc in subcommands)
             )
-            # Long Python scripts never create approval rules.
+            # Long Python scripts never create approval rules. Denials create a
+            # rule only when one was asked for (tool/domain/prefix); the deny
+            # reason becomes the rule's reason for later matches.
+            new_rule: Rule | None = None
             if decision_status == "approved" and not one_time:
-                tool = record["tool"]
-                args = (
-                    {"command": target_sub["command"]}
-                    if target_sub is not None
-                    else record["arguments"]
-                )
-                if allow_always == "tool":
-                    rule = Rule(id=str(uuid.uuid4()), kind="tool", tool=tool, action="allow", hits=1)
-                    created_rule = self.rules.add_rule(rule).to_dict()
-                elif allow_always == "domain":
-                    chosen = prefix.strip() or str(args.get("domain") or "").strip()
-                    if chosen:
-                        rule = Rule(
-                            id=str(uuid.uuid4()),
-                            kind="domain",
-                            tool=tool,
-                            action="allow",
-                            prefix=chosen,
-                            hits=1,
-                        )
-                        created_rule = self.rules.add_rule(rule).to_dict()
-                elif allow_always == "prefix":
-                    chosen = prefix.strip() or (
-                        record["suggested_prefixes"][0] if record["suggested_prefixes"] else ""
-                    )
-                    if chosen:
-                        has_cmd = "command" in args or "CommandLine" in args
-                        rule_kind = "command_prefix" if has_cmd else "path_prefix"
-                        rule_mode = "" if has_cmd else (_path_tool_level(tool) or "ro")
-                        rule_tool = tool if has_cmd else "*"
-                        rule = Rule(
-                            id=str(uuid.uuid4()),
-                            kind=rule_kind,
-                            tool=rule_tool,
-                            action="allow",
-                            prefix=chosen,
-                            mode=rule_mode,
-                            hits=1,
-                        )
-                        created_rule = self.rules.add_rule(rule).to_dict()
-                else:
-                    # Plain Approve remembers this exact call with a 12h TTL
-                    rule = Rule(
-                        id=str(uuid.uuid4()),
-                        kind="exact",
-                        tool=tool,
-                        action="allow",
-                        arguments=args,
-                        expires_at=utc_after_iso(12 * 3600),
-                        hits=1,
-                    )
-                    created_rule = self.rules.add_rule(rule).to_dict()
-
-                if created_rule is not None:
-                    matched_rule = Rule.from_dict(created_rule)
-                    for other in self._requests.values():
-                        if other["status"] != "pending":
-                            continue
-                        other_subs = other.get("subcommands") or []
-                        if other_subs:
-                            for sc in other_subs:
-                                if sc["status"] == "pending" and matched_rule.matches(
-                                    other["tool"], {"command": sc["command"]}
-                                ):
-                                    sc["status"] = "approved"
-                                    sc["rule_id"] = matched_rule.id
-                                    sc["labels"] = [rule_label(matched_rule)]
-                                    if sc is not target_sub:
-                                        self.rules.record_hit(matched_rule.id)
-                            if all(sc["status"] == "approved" for sc in other_subs):
-                                other["status"] = "approved"
-                                other["in_queue"] = False
-                                other["decision"] = {
-                                    "status": "approved",
-                                    "decided_at": utc_now_iso(),
-                                    "reason": f"Matched rule ({matched_rule.kind})",
-                                    "rule_id": matched_rule.id,
-                                    "labels": merge_labels(*(s.get("labels") for s in other_subs)),
-                                }
-                                self._add_history(other["id"])
-                        elif other["id"] != req_id and matched_rule.matches(
-                            other["tool"], other["arguments"]
-                        ):
-                            other["status"] = "approved"
-                            other["in_queue"] = False
-                            other["decision"] = {
-                                "status": "approved",
-                                "decided_at": utc_now_iso(),
-                                "reason": f"Matched rule ({matched_rule.kind})",
-                                "rule_id": matched_rule.id,
-                                "labels": [rule_label(matched_rule)],
-                            }
-                            self._add_history(other["id"])
-                            self.rules.record_hit(matched_rule.id)
+                new_rule = self._rule_for_decision(record, target_sub, "allow", allow_always, prefix)
+            elif decision_status == "denied" and allow_always in {"tool", "domain", "prefix"}:
+                new_rule = self._rule_for_decision(record, target_sub, "deny", allow_always, prefix, reason.strip())
+            if new_rule is not None:
+                created_rule = self.rules.add_rule(new_rule).to_dict()
+                self._apply_new_rule(Rule.from_dict(created_rule), record, target_sub)
 
             target = target_sub if target_sub is not None else record
             review = target.get("review")
@@ -1250,6 +1285,8 @@ class ApprovalHub:
                         "reason": reason.strip() or f"Denied subcommand: {target_sub['command']}",
                         "labels": own_labels,
                     }
+                    if created_rule is not None:
+                        record["decision"]["rule_id"] = created_rule["id"]
                     self._add_history(req_id)
                 elif all(sc["status"] == "approved" for sc in subcommands):
                     record["status"] = "approved"
@@ -1356,7 +1393,7 @@ class ApprovalHub:
         rule = self.rules.match(tool, {"command": command}, record_hit=False)
         if rule is not None and rule.action == "deny":
             return {**result, "decision": "denied", "stage": "rule",
-                    "reason": f"Matched rule ({rule.kind})", "rule_id": rule.id}
+                    "reason": rule_decision_reason(rule), "rule_id": rule.id}
         agent, agent_why = self._pick_review_agent("")
         verdict = run_python_review([*self.review_cmd, "--agent", agent], script)
         return {**result, **verdict, "stage": f"review · {agent}",
@@ -1606,6 +1643,14 @@ UI_HTML = """<!doctype html>
   .approve-label { font-size: 12px; font-weight: 600; color: var(--muted); margin-right: 2px; }
   .token-btn { background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 4px 8px; font-size: 12.5px; font-family: ui-monospace, monospace; cursor: pointer; transition: background 0.08s, border-color 0.08s; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; text-align: left; }
   .token-btn.lit { background: rgba(31, 111, 235, 0.35); border-color: var(--blue-h); color: #fff; }
+  .deny-mode .token-btn.lit { background: rgba(248, 81, 73, 0.3); border-color: #f85149; }
+  .deny-mode .prefix-preview { color: #ff7b72; }
+  button.mode-toggle { font-size: 12px; font-weight: 600; color: var(--muted); background: none; border: 1px dashed var(--border); border-radius: 5px; padding: 3px 7px; margin-right: 2px; cursor: pointer; }
+  button.mode-toggle:hover { color: var(--text); border-color: var(--muted); }
+  .deny-mode button.mode-toggle { color: #ff7b72; border-color: #f85149; border-style: solid; }
+  .rule-reason-row { display: flex; margin-top: 6px; }
+  input.reason.invalid { border-color: #f85149; }
+  .rule-reason-text { margin-top: 4px; font-size: 12px; color: var(--muted); }
   code.rule-code { font-family: ui-monospace, monospace; font-size: 13px; background: #0d1117; border: 1px solid var(--border); padding: 2px 7px; border-radius: 4px; color: var(--text); overflow-wrap: anywhere; word-break: break-word; }
   .chip-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
   .rule-chip { display: inline-flex; align-items: center; gap: 10px; background: #1c2128; border: 1px solid #363d46; border-radius: 8px; padding: 8px 12px; font-size: 13px; transition: border-color 0.1s, background 0.1s; }
@@ -2147,9 +2192,9 @@ async function fetchState() {
   render();
 }
 
-async function decide(id, decision, allowAlways = null, prefix = '', subIndex = null) {
+async function decide(id, decision, allowAlways = null, prefix = '', subIndex = null, reasonOverride = null) {
   const reasonEl = document.getElementById(reasonInputId(id, subIndex));
-  const reason = reasonEl ? reasonEl.value : '';
+  const reason = reasonOverride ?? (reasonEl ? reasonEl.value : '');
   await fetch('/api/ui/requests/' + encodeURIComponent(id) + '/decision', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -2189,6 +2234,8 @@ async function saveEditRule(id, kind) {
   const action = document.getElementById('edit-action-' + id).value;
   const val = document.getElementById('edit-val-' + id).value.trim();
   const body = { action };
+  const reasonEl = document.getElementById('edit-reason-' + id);
+  if (reasonEl && action === 'deny') body.reason = reasonEl.value.trim();
   const modeEl = document.getElementById('edit-mode-' + id);
   if (modeEl) body.mode = modeEl.value;
   if (kind === 'command_prefix' || kind === 'path_prefix' || kind === 'domain') {
@@ -2321,36 +2368,92 @@ function formatArgs(req) {
   return JSON.stringify(req.arguments || {}, null, 2);
 }
 
+// Token bars start in Approve mode; the label toggles a card's bar to Deny
+// mode, where a click creates a deny rule with the reason typed below it.
+const denyModes = new Set();  // token bar keys in Deny mode
+
+function tokenBarKey(reqId, subIndex = null) {
+  return subIndex === null ? reqId : `${reqId}-sub-${subIndex}`;
+}
+
+function ruleReasonInputId(reqId, subIndex = null) {
+  return 'rule-reason-' + tokenBarKey(reqId, subIndex);
+}
+
+function tokenPreviewIdle(deny) {
+  return deny
+    ? 'Type the reason, then click a token to deny always up to that prefix'
+    : 'Hover & click a token to allow always up to that prefix';
+}
+
 function highlightTokens(reqId, idx) {
   const bar = document.getElementById('tokens-' + reqId);
   const preview = document.getElementById('preview-' + reqId);
   if (!bar) return;
+  const deny = denyModes.has(reqId);
   const btns = bar.querySelectorAll('.token-btn');
   btns.forEach((b, i) => b.classList.toggle('lit', idx >= 0 && i <= idx));
   if (preview) {
     if (idx >= 0 && btns[idx]) {
-      preview.textContent = 'Click to allow always: ' + btns[idx].dataset.prefix;
+      preview.textContent = (deny ? 'Click to deny always: ' : 'Click to allow always: ') + btns[idx].dataset.prefix;
     } else {
-      preview.textContent = 'Hover & click a token to allow always up to that prefix';
+      preview.textContent = tokenPreviewIdle(deny);
     }
   }
 }
 
+function toggleTokenMode(reqId, subIndex = null) {
+  const key = tokenBarKey(reqId, subIndex);
+  if (denyModes.has(key)) {
+    denyModes.delete(key);
+  } else {
+    denyModes.add(key);
+    // Choosing Deny is a decision in progress: stop the auto-accept.
+    if (autoCurrent && autoCurrent.reqId === reqId && autoCurrent.subIndex === subIndex) {
+      cancelAutoDecide(autoCurrent.key);
+    }
+  }
+  queueMarkup = null;
+  render();
+  const input = document.getElementById(ruleReasonInputId(reqId, subIndex));
+  if (input) input.focus();
+}
+
+function tokenClick(btn, reqId, subIndex = null) {
+  if (!denyModes.has(tokenBarKey(reqId, subIndex))) {
+    decide(reqId, 'approved', 'prefix', btn.dataset.prefix, subIndex);
+    return;
+  }
+  const input = document.getElementById(ruleReasonInputId(reqId, subIndex));
+  const reason = input ? input.value.trim() : '';
+  if (!reason) {
+    if (input) { input.classList.add('invalid'); input.focus(); }
+    return;
+  }
+  decide(reqId, 'denied', 'prefix', btn.dataset.prefix, subIndex, reason);
+}
+
 function renderTokenBar(reqId, tokens, prefixes, subIndex = null, approveLabel = 'Approve:') {
   if (!tokens.length || tokens.length !== prefixes.length) return '';
-  const domKey = subIndex === null ? reqId : `${reqId}-sub-${subIndex}`;
+  const domKey = tokenBarKey(reqId, subIndex);
+  const deny = denyModes.has(domKey);
+  const subArg = subIndex === null ? 'null' : subIndex;
   const buttons = tokens.map((tok, i) =>
     `<button class="token-btn" data-prefix="${esc(prefixes[i])}"
       onmouseenter="highlightTokens('${esc(domKey)}', ${i})"
-      onclick="decide('${esc(reqId)}','approved','prefix', this.dataset.prefix, ${subIndex === null ? 'null' : subIndex})"
+      onclick="tokenClick(this, '${esc(reqId)}', ${subArg})"
     >${esc(tok)}</button>`
   ).join('');
+  const reasonRow = deny
+    ? `<div class="rule-reason-row"><input class="reason" id="${esc(ruleReasonInputId(reqId, subIndex))}" placeholder="Deny reason, told to the agent (required)..." oninput="this.classList.remove('invalid')" /></div>`
+    : '';
   return `
-    <div class="prefix-builder" onmouseleave="highlightTokens('${esc(domKey)}', -1)">
+    <div class="prefix-builder${deny ? ' deny-mode' : ''}" onmouseleave="highlightTokens('${esc(domKey)}', -1)">
       <div class="prefix-label">
-        <span id="preview-${esc(domKey)}" class="prefix-preview">Hover &amp; click a token to allow always up to that prefix</span>
+        <span id="preview-${esc(domKey)}" class="prefix-preview">${esc(tokenPreviewIdle(deny))}</span>
       </div>
-      <div class="token-bar" id="tokens-${esc(domKey)}"><span class="approve-label">${esc(approveLabel)}</span>${buttons}</div>
+      <div class="token-bar" id="tokens-${esc(domKey)}"><button class="mode-toggle" onclick="toggleTokenMode('${esc(reqId)}', ${subArg})" title="Switch between creating allow and deny rules">${esc(deny ? 'Deny:' : approveLabel)}</button>${buttons}</div>
+      ${reasonRow}
     </div>`;
 }
 
@@ -2552,7 +2655,7 @@ function renderQueue() {
         const tokenBar = sc.python_script != null ? '' : renderTokenBar(req.id, sc.command_tokens || [], sc.command_prefixes || [], sc.index);
         const approveAction = renderApproveActions(req.id, sc, sc.index);
         const auto = autoAction(req, sc, sc.index);
-        cards.push({ key: req.id + '#' + sc.index, inputId: reasonInputId(req.id, sc.index), auto, html: `
+        cards.push({ key: req.id + '#' + sc.index, inputId: reasonInputId(req.id, sc.index), ruleReasonId: ruleReasonInputId(req.id, sc.index), barKey: tokenBarKey(req.id, sc.index), auto, html: `
           <div class="card">
             <div class="card-head">
               <div><span class="pill ${esc(rt)}">${esc(rt)}</span> ${toolLabel(req, sc)} <span class="pill">step ${sc.index + 1}/${req.subcommands.length}</span>${stalePill}</div>
@@ -2583,7 +2686,7 @@ function renderQueue() {
       ? ''
       : `<button class="always" onclick="decide('${esc(req.id)}','approved','tool')" title="Allow always: ${esc(req.tool)}">Allow</button>`;
     const auto = autoAction(req, req, null);
-    cards.push({ key: req.id, inputId: reasonInputId(req.id), auto, html: `
+    cards.push({ key: req.id, inputId: reasonInputId(req.id), ruleReasonId: ruleReasonInputId(req.id), barKey: tokenBarKey(req.id), auto, html: `
       <div class="card">
         <div class="card-head">
           <div><span class="pill ${esc(rt)}">${esc(rt)}</span> ${toolLabel(req)}${stalePill}</div>
@@ -2669,7 +2772,7 @@ function renderRuleCard(r, editable = false) {
     return `
       <div class="card">
         <div class="actions" style="margin-top:0">
-          <select class="action-sel" id="edit-action-${esc(r.id)}">
+          <select class="action-sel" id="edit-action-${esc(r.id)}" onchange="document.getElementById('edit-reason-${esc(r.id)}').hidden = this.value !== 'deny'">
             <option value="allow" ${r.action === 'allow' ? 'selected' : ''}>allow</option>
             <option value="deny" ${r.action === 'deny' ? 'selected' : ''}>deny</option>
           </select>
@@ -2677,6 +2780,9 @@ function renderRuleCard(r, editable = false) {
           <input class="reason" id="edit-val-${esc(r.id)}" value="${esc(curVal)}" ${disabled} onkeydown="if(event.key==='Enter')saveEditRule('${esc(r.id)}','${esc(r.kind)}')" />
           <button class="approve" onclick="saveEditRule('${esc(r.id)}','${esc(r.kind)}')">Save</button>
           <button class="ghost" onclick="cancelEditRule()">Cancel</button>
+        </div>
+        <div class="rule-reason-row">
+          <input class="reason" id="edit-reason-${esc(r.id)}" value="${esc(r.reason || '')}" placeholder="Deny reason, told to the agent..." ${r.action === 'deny' ? '' : 'hidden'} onkeydown="if(event.key==='Enter')saveEditRule('${esc(r.id)}','${esc(r.kind)}')" />
         </div>
       </div>`;
   }
@@ -2697,6 +2803,7 @@ function renderRuleCard(r, editable = false) {
         <div class="btn-group">${hitsBadge}${editBtn}<button class="del-btn icon-btn" onclick="deleteRule('${esc(r.id)}')" title="Delete" aria-label="Delete">${ICON_TRASH}</button></div>
         <div>${actionBadge(r.action)} ${modeBadge}<code class="rule-code">${esc(desc)}</code></div>
       </div>
+      ${r.action === 'deny' && r.reason ? `<div class="rule-reason-text">${esc(r.reason)}</div>` : ''}
     </div>`;
 }
 
@@ -2795,7 +2902,11 @@ function render() {
   const markup = cards.length ? cards[idx].html : '';
   syncAutoCurrent(cards[idx]);
   // Drafts of cards that are only hidden (not decided) must survive.
-  const liveInputIds = new Set(cards.map(c => c.inputId));
+  const liveInputIds = new Set(cards.flatMap(c => [c.inputId, c.ruleReasonId]));
+  const liveBars = new Set(cards.map(c => c.barKey));
+  for (const key of denyModes) {
+    if (!liveBars.has(key)) denyModes.delete(key);
+  }
   if (markup !== queueMarkup) {
     const focused = document.activeElement;
     const selection = queueContent.contains(focused) && focused.matches('input.reason')
@@ -3142,6 +3253,7 @@ def make_handler(
                     prefix=payload.get("prefix"),
                     arguments=payload.get("arguments"),
                     mode=payload.get("mode"),
+                    reason=payload.get("reason"),
                 )
                 if updated is None:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "rule_not_found"})
