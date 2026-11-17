@@ -1658,6 +1658,9 @@ UI_HTML = """<!doctype html>
   .hu[hidden] { display: none; }
   .hu-meter { flex: none; position: relative; width: 116px; height: 26px; border-radius: 6px; background: #21262d; border: 1px solid var(--border); overflow: hidden; cursor: pointer; }
   .hu-meter:hover { border-color: #8b949e; }
+  .hu-pop { position: fixed; z-index: 40; width: min(720px, calc(100vw - 16px)); padding: 12px 14px 4px; background: var(--bg); border: 1px solid #8b949e; border-radius: 8px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5); pointer-events: none; }
+  .hu-pop[hidden] { display: none; }
+  .hu-pop .u-provider { margin-bottom: 8px; }
   .hu-meter > span { position: absolute; top: 0; bottom: 0; }
   .hu-fill { left: 0; background: var(--u); opacity: 0.45; }
   .hu-over { background: #f85149; opacity: 0.55; }
@@ -1710,6 +1713,7 @@ UI_HTML = """<!doctype html>
     <button class="tab" data-tab="usage">AI usage</button>
   </div>
   <div id="header-usage" class="hu" aria-label="AI usage" hidden></div>
+  <div id="hu-pop" class="hu-pop" hidden></div>
 </header>
 <main id="app"></main>
 <section id="queue-panel" class="queue-panel" aria-labelledby="queue-title">
@@ -1855,8 +1859,9 @@ async function fetchUsage() {
 let headerUsageMarkup = null;
 const HEADER_USAGE_SHORT = { 'Claude and GPT': 'Cl+GPT', 'Gemini 4 Argon': 'Argon' };
 
-function huMeter(key, name, w, fallback, tip) {
-  const open = `<div class="hu-meter u-${esc(key)}" title="${esc(tip)}" onclick="historyRuleFilter = null; setTab('usage')">`;
+function huMeter(key, name, w, fallback, tip, group = '') {
+  // Hovering shows this model group's AI usage rows in a popover.
+  const open = `<div class="hu-meter u-${esc(key)}" data-provider="${esc(key)}" data-group="${esc(group)}" aria-label="${esc(tip)}" onclick="historyRuleFilter = null; setTab('usage')">`;
   if (!w || w.used_percent == null) {
     return open + `<span class="hu-text"><span>${esc(name)}</span><span class="u-dim">n/a</span></span></div>`;
   }
@@ -1896,7 +1901,7 @@ function renderHeaderUsage() {
       // The window furthest ahead of its expected usage, labelled 5h/7d.
       const over = x => x.used_percent == null ? -Infinity : x.used_percent - (x.expected_percent ?? x.used_percent);
       const w = g.windows.reduce((a, b) => (over(b) > over(a) ? b : a));
-      items.push(huMeter(key, name, w, w.label === 'Weekly' ? '7d' : w.label, tip));
+      items.push(huMeter(key, name, w, w.label === 'Weekly' ? '7d' : w.label, tip, g.name));
     }
   }
   const markup = items.join('');
@@ -1904,7 +1909,50 @@ function renderHeaderUsage() {
   headerUsageMarkup = markup;
   el.innerHTML = markup;
   el.hidden = !markup;
+  if (huPopKey) showUsagePopover(huPopKey, huPopGroup);  // keep an open popover fresh
 }
+
+// Popover under a header meter with that model group's rows from the AI
+// usage tab (same markup); a provider-level error shows the whole provider.
+let huPopKey = null;
+let huPopGroup = '';
+let huPopAnchor = null;
+function showUsagePopover(key, group, anchor = huPopAnchor) {
+  const pop = document.getElementById('hu-pop');
+  const p = usage && usage.data && usage.data.providers && usage.data.providers[key];
+  if (!p || !anchor || !anchor.isConnected) {
+    anchor = [...document.querySelectorAll('#header-usage .hu-meter')]
+      .find(m => m.dataset.provider === key && m.dataset.group === group);
+    if (!p || !anchor) { hideUsagePopover(); return; }
+  }
+  huPopKey = key;
+  huPopGroup = group;
+  huPopAnchor = anchor;
+  const shown = group ? { ...p, groups: (p.groups || []).filter(g => g.name === group) } : p;
+  const markup = `<div class="u-grid">${usageProvider(key, shown)}</div>`;
+  if (pop.innerHTML !== markup) pop.innerHTML = markup;
+  pop.hidden = false;
+  const r = anchor.getBoundingClientRect();
+  const width = pop.offsetWidth;
+  pop.style.top = `${Math.round(r.bottom + 8)}px`;
+  pop.style.left = `${Math.round(Math.max(8, Math.min(r.left, window.innerWidth - width - 8)))}px`;
+}
+
+function hideUsagePopover() {
+  huPopKey = null;
+  huPopGroup = '';
+  huPopAnchor = null;
+  document.getElementById('hu-pop').hidden = true;
+}
+
+document.getElementById('header-usage').addEventListener('mouseover', e => {
+  const meter = e.target.closest('.hu-meter');
+  if (meter && meter !== huPopAnchor) showUsagePopover(meter.dataset.provider, meter.dataset.group, meter);
+});
+document.getElementById('header-usage').addEventListener('mouseout', e => {
+  const to = e.relatedTarget;
+  if (!to || !to.closest || !to.closest('.hu-meter')) hideUsagePopover();
+});
 
 // Where a decision came from (decision.labels, set by the server). Records
 // without labels (decided before they existed) show none.
