@@ -1561,7 +1561,8 @@ UI_HTML = """<!doctype html>
   .rule-card .action-icon { margin-right: 6px; position: relative; top: 2px; }
   .rule-card:hover { border-color: #58a6ff; background: #232a35; }
   .card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
-  .meta { font-size: 12px; color: var(--muted); display: flex; gap: 10px; flex-wrap: wrap; }
+  .meta { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .meta .auto-decide { margin-right: 6px; }
   .pill { font-size: 11px; padding: 2px 7px; border-radius: 4px; background: #21262d; color: var(--text); font-family: ui-monospace, monospace; }
   .pill.claude-code { background: rgba(210, 153, 34, 0.18); color: #f0b754; }
   .pill.codex { background: rgba(56, 139, 253, 0.18); color: #79c0ff; }
@@ -2412,7 +2413,7 @@ function renderApproveActions(reqId, target, subIndex = null) {
   const python = target.python_script != null;
   const allowAlways = python ? 'null' : "'exact'";
   const title = python ? 'Accept this script once' : 'Accept exact call for 12h';
-  return `<button class="approve" onclick="decide('${id}','approved',${allowAlways},'',${subArg})" title="${title}">Accept</button>`;
+  return `<button class="approve" onclick="decide('${id}','approved',${allowAlways},'',${subArg})" title="${title}">Accept${python ? '' : ' (12h)'}</button>`;
 }
 
 // When the reviewer suggests denial, pre-fill only the actionable deny reason.
@@ -2449,7 +2450,7 @@ function renderQueue() {
           <div class="card">
             <div class="card-head">
               <div><span class="pill ${esc(rt)}">${esc(rt)}</span> ${toolLabel(req, sc)} <span class="pill">step ${sc.index + 1}/${req.subcommands.length}</span>${stalePill}</div>
-              <div class="meta"><span>${esc(cwd)}</span><span>${esc(req.created_at)}</span></div>
+              <div class="meta">${python ? '' : renderAutoDecide(auto)}<span>${esc(cwd)}</span><span>${esc(req.created_at)}</span></div>
             </div>
             ${renderCallBody(req, sc, 'q-' + req.id + '-' + sc.index)}
             <details class="full-cmd-box" ${openScripts.has('full-' + req.id) ? 'open' : ''} ontoggle="if (this.open) openScripts.add('full-${esc(req.id)}'); else openScripts.delete('full-${esc(req.id)}')"><summary>Full command</summary><pre>${esc(formatArgs(req))}</pre></details>
@@ -2457,7 +2458,6 @@ function renderQueue() {
             ${tokenBar}
             <div class="actions">
               ${approveAction}
-              ${python ? '' : renderAutoDecide(auto)}
               ${renderReviewBtn(req.id, sc, sc.index)}
               <input class="reason" id="${esc(reasonInputId(req.id, sc.index))}" data-suggested="${esc(suggestedReason(sc))}" placeholder="Optional deny/approve note..." />
               <button class="deny" onclick="decide('${esc(req.id)}','denied',null,'',${sc.index})">Deny</button>
@@ -2482,14 +2482,13 @@ function renderQueue() {
       <div class="card">
         <div class="card-head">
           <div><span class="pill ${esc(rt)}">${esc(rt)}</span> ${toolLabel(req)}${stalePill}</div>
-          <div class="meta"><span>${esc(cwd)}</span><span>${esc(req.created_at)}</span></div>
+          <div class="meta">${python ? '' : renderAutoDecide(auto)}<span>${esc(cwd)}</span><span>${esc(req.created_at)}</span></div>
         </div>
         ${renderCallBody(req, req, 'q-' + req.id)}
         ${renderReviewBox(req.review, python ? renderAutoDecide(auto) : '')}
         ${tokenBar}
         <div class="actions">
           ${approveAction}
-          ${python ? '' : renderAutoDecide(auto)}
           ${domainBtn}
           ${renderReviewBtn(req.id, req)}
           ${allowToolBtn}
