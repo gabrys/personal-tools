@@ -68,4 +68,18 @@ the tool removes blank lines after confirmed rule cleanup and creates a `.bak-*`
 copy beside the file before saving. Ctrl+C or end-of-input cancels the session
 without saving.
 
+## aap_ui.py
+
+AAP approval server and Web UI (`python3 aap_ui.py serve`, http://127.0.0.1:8787).
+To run it as a systemd user service:
+
+```
+systemctl --user link ~/git/personal-tools/systemd/aap-ui.service
+systemctl --user enable --now aap-ui.service
+journalctl --user -u aap-ui -f        # logs
+systemctl --user restart aap-ui       # after pulling changes
+```
+
+Without `loginctl enable-linger $USER` it starts at login, not at boot.
+
 Run tests with `python3 -m unittest discover -s tests -v`.
