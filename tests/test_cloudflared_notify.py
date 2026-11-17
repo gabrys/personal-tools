@@ -21,6 +21,8 @@ import sys, time
 print("INF Requesting new quick Tunnel on trycloudflare.com...", flush=True)
 print("INF |  https://quiet-river-1234.trycloudflare.com  |", flush=True)
 print("ARGS " + " ".join(sys.argv[1:]), flush=True)
+import os
+print("ENV " + " ".join(sorted(k for k in os.environ if k.startswith("AAP_"))), flush=True)
 time.sleep(30)
 """
 
@@ -143,6 +145,7 @@ class MainTest(unittest.TestCase):
             self.assertEqual(proc.wait(5), 0)
             err = proc.stderr.read()
             self.assertIn("ARGS tunnel --no-autoupdate --url http://localhost:8787/", err)
+            self.assertNotIn("AAP_TUNNEL_POST", err)  # credentials never reach cloudflared
         finally:
             if proc.poll() is None:
                 proc.kill()

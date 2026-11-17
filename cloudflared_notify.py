@@ -105,8 +105,11 @@ def main(argv: list[str] | None = None) -> int:
     if not user:
         log("AAP_TUNNEL_POST_USER is not set; posting without basic auth")
 
+    # cloudflared logs its environment at startup; keep our credentials out of it.
+    child_env = {k: v for k, v in os.environ.items() if not k.startswith("AAP_TUNNEL_")}
     proc = subprocess.Popen(
         [args.cloudflared, "tunnel", "--no-autoupdate", "--url", args.url],
+        env=child_env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
