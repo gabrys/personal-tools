@@ -2166,7 +2166,7 @@ function renderReviewBtn(reqId, target, subIndex = null) {
   return `<button class="review-btn" ${disabled} onclick="startReview('${esc(reqId)}', ${subArg})">${label}</button>`;
 }
 
-function renderReviewBox(review, reqId = null, subIndex = null) {
+function renderReviewBox(review, autoHtml = '') {
   if (!review) return '';
   const by = review.agent ? ` by ${review.agent}` : '';
   if (review.status === 'running') {
@@ -2174,102 +2174,101 @@ function renderReviewBox(review, reqId = null, subIndex = null) {
   }
   if (!review.decision) return `<div class="review-box">🔎 ${esc(review.summary || review.status)}</div>`;
   return renderVerdict(review.decision, review.deny_reason ?? (review.explanation ? '' : review.summary), 'review' + by,
-    review.agent_reason ? `<div class="meta">${esc(review.agent_reason)}</div>` : '', review.explanation,
-    reqId === null ? '' : renderAutoDecide(reqId, subIndex, review));
+    review.agent_reason ? `<div class="meta">${esc(review.agent_reason)}</div>` : '', review.explanation, autoHtml);
 }
 
-// A finished review's verdict is applied automatically AUTO_DECIDE_MS after
-// this page first shows it (so a page opened later never decides at once),
-// unless the user cancels it, edits the reason, or decides first. The
-// countdown text is filled in by autoDecideTick().
+// Auto-decision: only the request currently shown in the queue counts down,
+// for AUTO_DECIDE_MS from the moment it is shown. When it fires and the next
+// request takes its place, that one starts its own countdown, so a long
+// queue is decided one request at a time. Python scripts are auto-decided
+// only after a review (its verdict is applied); other requests are accepted
+// for 12h (exact call). Cancel, typing a reason, switching cards or deciding
+// manually all stop the current countdown.
 const AUTO_DECIDE_MS = 30000;
 const autoCancelled = new Set();
 const autoFired = new Set();
-const autoDeadlines = new Map();  // key -> ms timestamp
+let autoCurrent = null;  // {key, reqId, subIndex, decision, allowAlways, verb, review, deadline}
 
-function autoDeadline(key) {
-  if (!autoDeadlines.has(key)) autoDeadlines.set(key, Date.now() + AUTO_DECIDE_MS);
-  return autoDeadlines.get(key);
+function autoAction(req, target, subIndex) {
+  if (req.status !== 'pending') return null;
+  const base = req.id + '#' + (subIndex === null ? '' : subIndex);
+  if (target.python_script != null) {
+    const r = target.review;
+    if (!(r && r.status === 'done' && r.decision)) return null;
+    const approved = r.decision === 'approved';
+    return { key: base + '@' + r.finished_at, reqId: req.id, subIndex, review: r,
+             decision: approved ? 'approved' : 'denied', allowAlways: null,
+             verb: approved ? 'Auto-accept' : 'Auto-deny' };
+  }
+  return { key: base, reqId: req.id, subIndex, review: null,
+           decision: 'approved', allowAlways: 'exact', verb: 'Auto-accept (12h)' };
 }
 
-function autoDecideKey(reqId, subIndex, review) {
-  return reqId + '#' + (subIndex === null ? '' : subIndex) + '@' + review.finished_at;
+function renderAutoDecide(action) {
+  if (!action) return '';
+  if (autoCancelled.has(action.key)) return '<span class="auto-decide u-dim">Auto-decision cancelled</span>';
+  return `<span class="auto-decide ${action.decision === 'approved' ? 'status-approved' : 'status-denied'}">` +
+    `<span class="auto-count"></span>` +
+    `<button class="ghost" onclick="cancelAutoDecide('${esc(action.key)}')">Cancel</button></span>`;
 }
 
-function autoDecideTarget(review) {
-  return review && review.status === 'done' && review.decision && review.finished_at
-    && !isNaN(Date.parse(review.finished_at));
-}
-
-function renderAutoDecide(reqId, subIndex, review) {
-  if (!autoDecideTarget(review)) return '';
-  const key = autoDecideKey(reqId, subIndex, review);
-  if (autoCancelled.has(key)) return '<span class="auto-decide u-dim">Auto-decision cancelled</span>';
-  const verb = review.decision === 'approved' ? 'Auto-accept' : 'Auto-deny';
-  const deadline = autoDeadline(key);
-  return `<span class="auto-decide ${review.decision === 'approved' ? 'status-approved' : 'status-denied'}">` +
-    `<span class="auto-count" data-deadline="${deadline}" data-verb="${verb}"></span>` +
-    `<button class="ghost" onclick="cancelAutoDecide('${esc(key)}')">Cancel</button></span>`;
+// Called by render() with the card now shown; keeps the running deadline
+// while the same card stays shown, starts a fresh one when it changes.
+function syncAutoCurrent(card) {
+  const a = card && card.auto;
+  if (!a || activeTab === 'test' || autoCancelled.has(a.key) || autoFired.has(a.key)) {
+    autoCurrent = null;
+    return;
+  }
+  const deadline = autoCurrent && autoCurrent.key === a.key ? autoCurrent.deadline : Date.now() + AUTO_DECIDE_MS;
+  autoCurrent = { ...a, deadline };
 }
 
 function cancelAutoDecide(key) {
   autoCancelled.add(key);
+  if (autoCurrent && autoCurrent.key === key) autoCurrent = null;
   queueMarkup = null;  // force the queue to re-render without the countdown
   render();
 }
 
-// Typing in a card's reason box cancels that card's pending auto-decision.
+// Typing in the shown card's reason box cancels its auto-decision.
 function cancelAutoDecideForInput(inputId) {
-  for (const t of autoDecideTargets()) {
-    if (reasonInputId(t.reqId, t.subIndex) === inputId && !autoCancelled.has(t.key)) cancelAutoDecide(t.key);
+  if (autoCurrent && reasonInputId(autoCurrent.reqId, autoCurrent.subIndex) === inputId) {
+    cancelAutoDecide(autoCurrent.key);
   }
-}
-
-function autoDecideTargets() {
-  const out = [];
-  for (const req of state.pending) {
-    const subs = (req.subcommands || []).filter(sc => sc.status === 'pending');
-    const items = subs.length ? subs.map(sc => [sc, sc.index]) : [[req, null]];
-    for (const [target, subIndex] of items) {
-      const review = target.review;
-      if (!autoDecideTarget(review)) continue;
-      const key = autoDecideKey(req.id, subIndex, review);
-      out.push({ reqId: req.id, subIndex, review, key, deadline: autoDeadline(key) });
-    }
-  }
-  return out;
 }
 
 function updateAutoCounts(now = Date.now()) {
   for (const el of document.querySelectorAll('.auto-count')) {
-    const left = Math.max(0, Math.ceil((Number(el.dataset.deadline) - now) / 1000));
-    el.textContent = `${el.dataset.verb} in ${left}s`;
+    if (!autoCurrent) { el.textContent = ''; continue; }
+    const left = Math.max(0, Math.ceil((autoCurrent.deadline - now) / 1000));
+    el.textContent = `${autoCurrent.verb} in ${left}s`;
   }
 }
 
 async function autoDecideTick() {
   const now = Date.now();
   updateAutoCounts(now);
-  for (const t of autoDecideTargets()) {
-    if (now < t.deadline || autoCancelled.has(t.key) || autoFired.has(t.key)) continue;
-    autoFired.add(t.key);
-    const approved = t.review.decision === 'approved';
-    const inputId = reasonInputId(t.reqId, t.subIndex);
-    const input = document.getElementById(inputId);
-    const typed = input ? input.value : (reasonDrafts.get(inputId) || '');
-    const by = t.review.agent ? ` by ${t.review.agent}` : '';
-    const reason = approved
-      ? `Auto-accepted after review${by}`
-      : (typed || t.review.deny_reason || t.review.summary || `Auto-denied after review${by}`);
-    try {
-      await fetch('/api/ui/requests/' + encodeURIComponent(t.reqId) + '/decision', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ decision: approved ? 'approved' : 'denied', reason, allow_always: null, prefix: '', sub_index: t.subIndex }),
-      });
-    } catch (e) {}
-    await fetchState();
-  }
+  const a = autoCurrent;
+  if (!a || now < a.deadline || autoFired.has(a.key)) return;
+  autoFired.add(a.key);
+  autoCurrent = null;
+  const inputId = reasonInputId(a.reqId, a.subIndex);
+  const input = document.getElementById(inputId);
+  const typed = input ? input.value : (reasonDrafts.get(inputId) || '');
+  const by = a.review && a.review.agent ? ` by ${a.review.agent}` : '';
+  let reason;
+  if (!a.review) reason = `Auto-accepted for 12h after ${AUTO_DECIDE_MS / 1000}s`;
+  else if (a.decision === 'approved') reason = `Auto-accepted after review${by}`;
+  else reason = typed || a.review.deny_reason || a.review.summary || `Auto-denied after review${by}`;
+  try {
+    await fetch('/api/ui/requests/' + encodeURIComponent(a.reqId) + '/decision', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: a.decision, reason, allow_always: a.allowAlways, prefix: '', sub_index: a.subIndex }),
+    });
+  } catch (e) {}
+  await fetchState();
 }
 setInterval(autoDecideTick, 500);
 
@@ -2311,7 +2310,9 @@ function renderQueue() {
       for (const sc of subs) {
         const tokenBar = sc.python_script != null ? '' : renderTokenBar(req.id, sc.command_tokens || [], sc.command_prefixes || [], sc.index);
         const approveAction = renderApproveActions(req.id, sc, sc.index);
-        cards.push({ key: req.id + '#' + sc.index, inputId: reasonInputId(req.id, sc.index), html: `
+        const auto = autoAction(req, sc, sc.index);
+        const python = sc.python_script != null;
+        cards.push({ key: req.id + '#' + sc.index, inputId: reasonInputId(req.id, sc.index), auto, html: `
           <div class="card">
             <div class="card-head">
               <div><span class="pill ${esc(rt)}">${esc(rt)}</span> ${toolLabel(req, sc)} <span class="pill">step ${sc.index + 1}/${req.subcommands.length}</span>${stalePill}</div>
@@ -2319,10 +2320,11 @@ function renderQueue() {
             </div>
             ${renderCallBody(req, sc, 'q-' + req.id + '-' + sc.index)}
             <details class="full-cmd-box" ${openScripts.has('full-' + req.id) ? 'open' : ''} ontoggle="if (this.open) openScripts.add('full-${esc(req.id)}'); else openScripts.delete('full-${esc(req.id)}')"><summary>Full command</summary><pre>${esc(formatArgs(req))}</pre></details>
-            ${renderReviewBox(sc.review, req.id, sc.index)}
+            ${renderReviewBox(sc.review, python ? renderAutoDecide(auto) : '')}
             ${tokenBar}
             <div class="actions">
               ${approveAction}
+              ${python ? '' : renderAutoDecide(auto)}
               ${renderReviewBtn(req.id, sc, sc.index)}
               <input class="reason" id="${esc(reasonInputId(req.id, sc.index))}" data-suggested="${esc(suggestedReason(sc))}" placeholder="Optional deny/approve note..." />
               <button class="deny" onclick="decide('${esc(req.id)}','denied',null,'',${sc.index})">Deny</button>
@@ -2341,17 +2343,20 @@ function renderQueue() {
     const allowToolBtn = (tokenBar || domainBtn || req.python_script != null)
       ? ''
       : `<button class="always" onclick="decide('${esc(req.id)}','approved','tool')" title="Allow always: ${esc(req.tool)}">Allow</button>`;
-    cards.push({ key: req.id, inputId: reasonInputId(req.id), html: `
+    const auto = autoAction(req, req, null);
+    const python = req.python_script != null;
+    cards.push({ key: req.id, inputId: reasonInputId(req.id), auto, html: `
       <div class="card">
         <div class="card-head">
           <div><span class="pill ${esc(rt)}">${esc(rt)}</span> ${toolLabel(req)}${stalePill}</div>
           <div class="meta"><span>${esc(cwd)}</span><span>${esc(req.created_at)}</span></div>
         </div>
         ${renderCallBody(req, req, 'q-' + req.id)}
-        ${renderReviewBox(req.review, req.id)}
+        ${renderReviewBox(req.review, python ? renderAutoDecide(auto) : '')}
         ${tokenBar}
         <div class="actions">
           ${approveAction}
+          ${python ? '' : renderAutoDecide(auto)}
           ${domainBtn}
           ${renderReviewBtn(req.id, req)}
           ${allowToolBtn}
@@ -2550,6 +2555,7 @@ function render() {
   document.getElementById('queue-prev').disabled = idx <= 0;
   document.getElementById('queue-next').disabled = idx >= cards.length - 1;
   const markup = cards.length ? cards[idx].html : '';
+  syncAutoCurrent(cards[idx]);
   // Drafts of cards that are only hidden (not decided) must survive.
   const liveInputIds = new Set(cards.map(c => c.inputId));
   if (markup !== queueMarkup) {
