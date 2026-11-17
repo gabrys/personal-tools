@@ -1652,6 +1652,8 @@ UI_HTML = """<!doctype html>
   .u-heading { margin-bottom: 16px; }
   /* Header usage strip: one meter per model group. */
   header h1, header .tabs { flex: none; white-space: nowrap; }
+  /* Narrow windows: drop the app title so the usage meters fit. */
+  @media (max-width: 1250px) { header h1 { display: none; } }
   .hu { margin-left: auto; display: flex; align-items: center; gap: 8px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
   .hu[hidden] { display: none; }
   .hu-meter { flex: none; position: relative; width: 116px; height: 26px; border-radius: 6px; background: #21262d; border: 1px solid var(--border); overflow: hidden; cursor: pointer; }
