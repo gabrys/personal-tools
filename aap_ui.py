@@ -477,6 +477,78 @@ def _extract_path_arg(arguments: dict[str, Any]) -> str | None:
     return None
 
 
+_SITE_OPERATOR = re.compile(r"(?:^|\s)site:\s*(?:https?://)?([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)", re.IGNORECASE)
+# Codex webrun operations that name a page by `ref_id` (a URL, or a reference
+# like "turn0search3" to an earlier search result) and ones that send a query.
+WEBRUN_PAGE_OPS = ("open", "find", "click", "screenshot")
+WEBRUN_QUERY_OPS = ("search_query", "image_query")
+WEBRUN_OPTION_KEYS = {"response_length"}
+WEB_TOOLS = {"webrun", "search_web", "WebFetch"}
+
+
+def _url_host(value: Any) -> str | None:
+    if not isinstance(value, str) or not re.match(r"(?i)\s*https?://", value):
+        return None
+    try:
+        host = urllib.parse.urlsplit(value.strip()).hostname
+    except ValueError:
+        return None
+    return host.rstrip(".").lower() if host else None
+
+
+def extract_web_domains(tool: str, arguments: dict[str, Any]) -> tuple[list[str], bool]:
+    """Domains a web tool call reaches, and whether part of it reaches
+    somewhere unknown (an unrestricted search, a result reference instead of
+    a URL, an unrecognised operation). Allow domain rules only cover calls
+    with no unknown part; deny domain rules fire on any listed domain."""
+    domains: list[str] = []
+    unresolved = False
+
+    def add(host: str | None) -> None:
+        nonlocal unresolved
+        if host:
+            if host not in domains:
+                domains.append(host)
+        else:
+            unresolved = True
+
+    if tool == "search_web":
+        dom = arguments.get("domain")
+        add(dom.strip().lower() if isinstance(dom, str) and dom.strip() else None)
+    elif tool == "WebFetch":
+        add(_url_host(arguments.get("url")))
+    elif tool == "webrun":
+        for key, items in arguments.items():
+            if key in WEBRUN_OPTION_KEYS:
+                continue
+            if key not in WEBRUN_PAGE_OPS + WEBRUN_QUERY_OPS or not isinstance(items, list):
+                unresolved = True
+                continue
+            for item in items:
+                item = item if isinstance(item, dict) else {}
+                if key in WEBRUN_PAGE_OPS:
+                    add(_url_host(item.get("ref_id")))
+                else:
+                    q = item.get("q")
+                    sites = _SITE_OPERATOR.findall(q) if isinstance(q, str) else []
+                    # One site: keeps the search on that site; with several
+                    # (or none) results may come from anywhere.
+                    add(sites[0].rstrip(".").lower() if len(sites) == 1 else None)
+    else:
+        unresolved = True
+    return domains, unresolved
+
+
+def _domain_matches(pattern: str, host: str) -> bool:
+    """`example.com` matches only that host; `*.example.com` matches it and
+    every subdomain; other `*` wildcards match any characters."""
+    pattern = pattern.strip().lower()
+    if pattern.startswith("*.") and "*" not in pattern[2:]:
+        base = pattern[2:]
+        return host == base or host.endswith("." + base)
+    return _match_token_wildcard(pattern, host)
+
+
 def _rule_path_level(rule: "Rule") -> str:
     if rule.mode in {"ro", "rw"}:
         return rule.mode
@@ -631,10 +703,13 @@ class Rule:
             command = arguments.get("command") or arguments.get("CommandLine")
             return isinstance(command, str) and _command_matches_prefix(command, self.prefix)
         if self.kind == "domain":
-            dom = arguments.get("domain")
             if self.prefix == "*":
                 return True
-            return isinstance(dom, str) and _match_token_wildcard(self.prefix, dom)
+            domains, unresolved = extract_web_domains(tool, arguments)
+            hits = [d for d in domains if _domain_matches(self.prefix, d)]
+            if self.action == "deny":
+                return bool(hits)
+            return bool(domains) and not unresolved and len(hits) == len(domains)
         if self.kind == "exact":
             return (self.arguments or {}) == (arguments or {})
         return False
@@ -1130,6 +1205,7 @@ class ApprovalHub:
                 path_mode = _path_tool_level(tool) or "ro"
             else:
                 cmd_tokens, cmd_prefixes = [], []
+            web_domains, web_unresolved = extract_web_domains(tool, arguments)
             record: dict[str, Any] = {
                 "id": req_id,
                 "tool": tool,
@@ -1149,6 +1225,8 @@ class ApprovalHub:
                 "subcommands": subcommands,
                 "python_script": extract_reviewable_python_script(cmd_str) if (has_cmd and not subcommands) else None,
                 "path_mode": path_mode,
+                "domains": web_domains,
+                "domains_unresolved": web_unresolved and tool in WEB_TOOLS,
                 "review": None,
                 "in_queue": status == "pending",
             }
@@ -1236,7 +1314,7 @@ class ApprovalHub:
         if allow_always == "tool":
             return Rule(kind="tool", **base)
         if allow_always == "domain":
-            chosen = prefix.strip() or str(args.get("domain") or "").strip()
+            chosen = prefix.strip() or next(iter(record.get("domains") or []), "")
             return Rule(kind="domain", prefix=chosen, **base) if chosen else None
         if allow_always == "prefix":
             chosen = prefix.strip() or (
@@ -2394,6 +2472,19 @@ function formatArgs(req) {
     const d = req.arguments.domain ? `[${req.arguments.domain}] ` : '';
     return `${d}${req.arguments.query || ''}`;
   }
+  if (req.arguments && req.tool === 'webrun') {
+    const parts = [];
+    for (const [op, items] of Object.entries(req.arguments)) {
+      if (!Array.isArray(items)) continue;
+      for (const it of items) {
+        const o = it || {};
+        const what = o.q != null ? o.q : (o.ref_id != null ? o.ref_id : JSON.stringify(o));
+        parts.push(`${op}: ${what}${o.pattern != null ? ` [${o.pattern}]` : ''}`);
+      }
+    }
+    const d = (req.domains || []).length ? `[${req.domains.join(', ')}${req.domains_unresolved ? ', ?' : ''}] ` : '';
+    return d + parts.join('\n');
+  }
   if (req.arguments) {
     const p = req.arguments.Path || req.arguments.file_path || req.arguments.path;
     if (typeof p === 'string') {
@@ -2717,10 +2808,9 @@ function renderQueue() {
     const tokenBarLabel = req.path_mode ? `Approve (${req.path_mode}):` : 'Approve:';
     const tokenBar = req.python_script != null ? '' : renderTokenBar(req.id, req.command_tokens || [], req.command_prefixes || [], null, tokenBarLabel);
     const approveAction = renderApproveActions(req.id, req);
-    const dom = (req.tool === 'search_web' && req.arguments && req.arguments.domain) ? String(req.arguments.domain) : '';
-    const domainBtn = dom
-      ? `<button class="always" onclick="decide('${esc(req.id)}','approved','domain','${esc(dom)}')">Allow domain: ${esc(dom)}</button>`
-      : '';
+    const domainBtn = (req.domains || []).map(dom =>
+      `<button class="always" onclick="decide('${esc(req.id)}','approved','domain','${esc(dom)}')">Allow domain: ${esc(dom)}</button>`
+    ).join('');
     const allowToolBtn = (tokenBar || domainBtn || req.python_script != null)
       ? ''
       : `<button class="always" onclick="decide('${esc(req.id)}','approved','tool')" title="Allow always: ${esc(req.tool)}">Allow</button>`;

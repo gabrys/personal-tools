@@ -834,6 +834,62 @@ class AAPUITest(unittest.TestCase):
         )
         self.assertEqual(r3["status"], "pending")
 
+    def test_webrun_domains_extracted(self) -> None:
+        cases = [
+            ({"open": [{"ref_id": "https://app.fitssey.com/docs/api"}],
+              "find": [{"ref_id": "https://App.Fitssey.com/docs/api", "pattern": "x"}],
+              "response_length": "long"},
+             (["app.fitssey.com"], False)),
+            ({"search_query": [{"q": "site:developers.cloudflare.com tunnel 502"}]},
+             (["developers.cloudflare.com"], False)),
+            ({"search_query": [{"q": "cloudflared quick tunnel"}]}, ([], True)),
+            ({"search_query": [{"q": "site.help.fitssey.com eksport"}]}, ([], True)),
+            ({"search_query": [{"q": "site:a.com site:b.com x"}]}, ([], True)),
+            ({"open": [{"ref_id": "turn0search3"}, {"ref_id": "https://x.org/a?b=1"}]}, (["x.org"], True)),
+            ({"weather": [{"location": "Warsaw"}]}, ([], True)),
+        ]
+        for args, expected in cases:
+            self.assertEqual(aap_ui.extract_web_domains("webrun", args), expected, args)
+        self.assertEqual(aap_ui.extract_web_domains("WebFetch", {"url": "https://docs.python.org/3/"}),
+                         (["docs.python.org"], False))
+
+    def _webrun(self, key: str, args: dict) -> dict:
+        _, created = self._req(
+            "POST", "/api/aap/v1/requests", {"tool": "webrun", "arguments": args}, {"Idempotency-Key": key}
+        )
+        return created
+
+    def test_webrun_domain_rules(self) -> None:
+        for prefix, action in (("*.fitssey.com", "allow"), ("evil.example", "deny")):
+            self._req("POST", "/api/ui/rules",
+                      {"kind": "domain", "tool": "webrun", "action": action, "prefix": prefix})
+        page = lambda url: {"open": [{"ref_id": url}]}
+        r = self._webrun("wr-1", page("https://app.fitssey.com/docs/api"))
+        self.assertEqual(r["status"], "approved")
+        self.assertEqual(r["domains"], ["app.fitssey.com"])
+        self.assertEqual(self._webrun("wr-2", page("https://fitssey.com/"))["status"], "approved")
+        self.assertEqual(self._webrun("wr-3", page("https://notfitssey.com/"))["status"], "pending")
+        # Every domain must be allowed, and nothing may be unresolved
+        self.assertEqual(self._webrun("wr-4", {"open": [{"ref_id": "https://fitssey.com/"},
+                                                        {"ref_id": "https://other.org/"}]})["status"], "pending")
+        self.assertEqual(self._webrun("wr-5", {**page("https://fitssey.com/"),
+                                               "search_query": [{"q": "anything"}]})["status"], "pending")
+        self.assertEqual(self._webrun("wr-6", {"search_query": [{"q": "site:help.fitssey.com raporty"}]})["status"],
+                         "approved")
+        # A denied domain anywhere in the call denies it, even over a whole-tool allow
+        self._req("POST", "/api/ui/rules", {"kind": "tool", "tool": "webrun", "action": "allow"})
+        self.assertEqual(self._webrun("wr-7", {"open": [{"ref_id": "https://fitssey.com/"},
+                                                        {"ref_id": "https://evil.example/?d=1"}]})["status"], "denied")
+        self.assertEqual(self._webrun("wr-8", {"search_query": [{"q": "x"}]})["status"], "approved")
+
+    def test_webrun_allow_domain_button(self) -> None:
+        r = self._webrun("wrb-1", {"open": [{"ref_id": "https://developers.cloudflare.com/x"}]})
+        self.assertEqual(r["status"], "pending")
+        self._req("POST", f"/api/ui/requests/{r['id']}/decision",
+                  {"decision": "approved", "allow_always": "domain"})
+        self.assertEqual(self._webrun("wrb-2", {"find": [{"ref_id": "https://developers.cloudflare.com/y",
+                                                           "pattern": "z"}]})["status"], "approved")
+
     def test_rule_hit_counter(self) -> None:
         _, rule = self._req(
             "POST",
