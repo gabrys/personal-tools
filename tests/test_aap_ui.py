@@ -345,12 +345,12 @@ class AAPUITest(unittest.TestCase):
             ],
         }
         self.assertEqual(aap_ui.mobile_notifications(state, now=now), [
-            {"id": "a", "title": "claude-code run: waiting", "text": "git push…"},
-            {"id": "b", "title": "agent Edit: waiting", "text": "/x/y.py"},
-            {"id": "d", "title": "claude-code run: waiting", "text": long_cmd[:79] + "…"},
-            {"id": "e", "title": "claude-code Python: waiting", "text": "Lists files"},
-            {"id": "f", "title": "claude-code run: auto-approved", "text": "ls"},
-            {"id": "g", "title": "claude-code run: auto-denied", "text": "rm x"},
+            {"id": "a", "title": "run: waiting", "text": "git push…"},
+            {"id": "b", "title": "Edit: waiting", "text": "/x/y.py"},
+            {"id": "d", "title": "run: waiting", "text": long_cmd[:79] + "…"},
+            {"id": "e", "title": "Python: waiting", "text": "Lists files"},
+            {"id": "f", "title": "run: auto-approved", "text": "ls"},
+            {"id": "g", "title": "run: auto-denied", "text": "rm x"},
         ])
 
     def test_extract_python_c_script_forms(self) -> None:

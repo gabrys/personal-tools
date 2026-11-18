@@ -517,10 +517,9 @@ def mobile_notifications(state: dict[str, Any], now: float | None = None) -> lis
 
 
 def _mobile_who(req: dict[str, Any]) -> str:
-    runtime = (req.get("context") or {}).get("runtime") or "agent"
     if req.get("python_script") is not None:
-        return f"{runtime} Python"
-    return f"{runtime} {'run' if req.get('tool') in SHELL_TOOLS else req.get('tool')}"
+        return "Python"
+    return "run" if req.get("tool") in SHELL_TOOLS else str(req.get("tool"))
 
 # Where a decision came from, stored as decision["labels"] (in this order):
 #   rule      - an existing permanent rule matched
