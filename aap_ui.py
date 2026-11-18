@@ -1558,9 +1558,7 @@ UI_HTML = """<!doctype html>
   .queue-content .card:last-child { margin-bottom: 0; }
   .queue-content pre { max-height: 144px; overflow-y: auto; }
   @media (max-width: 640px) {
-    header { flex-direction: column; align-items: flex-start; gap: 10px; padding: 12px 16px; }
-    .tabs { flex-wrap: wrap; }
-    .hu { margin-left: 0; max-width: 100%; }
+    header { gap: 10px 14px; padding: 12px 16px; }
     .queue-content input.reason { min-width: 140px; }
   }
   .panel-title { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 10px; display: flex; align-items: center; justify-content: space-between; }
@@ -1676,10 +1674,13 @@ UI_HTML = """<!doctype html>
   .u-heading { margin-bottom: 16px; }
   /* Header usage strip: one meter per model group. */
   header h1, header .tabs { flex: none; white-space: nowrap; }
-  /* Narrow windows: drop the app title so the usage meters fit. */
-  @media (max-width: 1250px) { header h1 { display: none; } }
   .hu { margin-left: auto; display: flex; align-items: center; gap: 8px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
   .hu[hidden] { display: none; }
+  /* Narrow windows: two rows, dot + name + tabs, then the usage meters. */
+  @media (max-width: 1250px) {
+    header { flex-wrap: wrap; }
+    .hu { flex: 1 0 100%; margin-left: 0; }
+  }
   .hu-meter { flex: none; position: relative; width: 116px; height: 26px; border-radius: 6px; background: #21262d; border: 1px solid var(--border); overflow: hidden; cursor: pointer; }
   .hu-meter:hover { border-color: #8b949e; }
   /* Only the usage table is shown, framed like a popover. */
@@ -1731,8 +1732,7 @@ UI_HTML = """<!doctype html>
 </head>
 <body>
 <header>
-  <h1>aap-ui</h1>
-  <span id="status-dot" class="status-dot" role="status" hidden></span>
+  <h1><span id="status-dot" class="status-dot" role="status" hidden></span>aap-ui</h1>
   <div class="tabs">
     <button class="tab" data-tab="live">Rules</button>
     <button class="tab active" data-tab="history">History</button>

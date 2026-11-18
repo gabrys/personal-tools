@@ -317,7 +317,7 @@ class AAPUITest(unittest.TestCase):
         for path in ("/", "/rules", "/history", "/ai-usage"):
             with urllib.request.urlopen(f"{self.base_url}{path}", timeout=5.0) as resp:
                 self.assertEqual(resp.status, 200)
-                self.assertIn("<h1>aap-ui</h1>", resp.read().decode("utf-8"))
+                self.assertIn("aap-ui</h1>", resp.read().decode("utf-8"))
         for path in ("/nope", "/test"):
             with self.assertRaises(urllib.error.HTTPError):
                 urllib.request.urlopen(f"{self.base_url}{path}", timeout=5.0)
