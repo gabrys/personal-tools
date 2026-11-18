@@ -1527,7 +1527,7 @@ UI_HTML = """<!doctype html>
   }
   * { box-sizing: border-box; }
   body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); }
-  header { display: flex; align-items: center; justify-content: flex-start; gap: 20px; padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--card); position: sticky; top: 0; z-index: 10; }
+  header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 20px; padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--card); position: sticky; top: 0; z-index: 10; }
   header h1 { margin: 0; font-size: 16px; display: flex; align-items: center; gap: 10px; }
   .status-dot { flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--red-h); box-shadow: 0 0 0 3px rgba(248, 81, 73, 0.25); }
   .status-dot.online { background: var(--green-h); box-shadow: 0 0 0 3px rgba(46, 160, 67, 0.25); }
@@ -1673,14 +1673,12 @@ UI_HTML = """<!doctype html>
   .u-alert { font-size: 11.5px; text-transform: none; letter-spacing: 0; color: #ffa198; background: rgba(218, 54, 51, 0.16); border: 1px solid rgba(248, 81, 73, 0.35); border-radius: 999px; padding: 1px 8px; }
   .u-heading { margin-bottom: 16px; }
   /* Header usage strip: one meter per model group. */
+  /* Name + tabs on the left, usage strip on the right; the strip never
+     shrinks, so when it does not fit it wraps to a row of its own. */
+  .head-main { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 20px; }
   header h1, header .tabs { flex: none; white-space: nowrap; }
-  .hu { margin-left: auto; display: flex; align-items: center; gap: 8px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  .hu { flex: none; max-width: 100%; display: flex; align-items: center; gap: 8px; overflow-x: auto; scrollbar-width: none; }
   .hu[hidden] { display: none; }
-  /* Narrow windows: two rows, dot + name + tabs, then the usage meters. */
-  @media (max-width: 1250px) {
-    header { flex-wrap: wrap; }
-    .hu { flex: 1 0 100%; margin-left: 0; }
-  }
   .hu-meter { flex: none; position: relative; width: 116px; height: 26px; border-radius: 6px; background: #21262d; border: 1px solid var(--border); overflow: hidden; cursor: pointer; }
   .hu-meter:hover { border-color: #8b949e; }
   /* Only the usage table is shown, framed like a popover. */
@@ -1732,11 +1730,13 @@ UI_HTML = """<!doctype html>
 </head>
 <body>
 <header>
-  <h1><span id="status-dot" class="status-dot" role="status" hidden></span>aap-ui</h1>
-  <div class="tabs">
-    <button class="tab" data-tab="live">Rules</button>
-    <button class="tab active" data-tab="history">History</button>
-    <button class="tab" data-tab="usage">AI usage</button>
+  <div class="head-main">
+    <h1><span id="status-dot" class="status-dot" role="status" hidden></span>aap-ui</h1>
+    <div class="tabs">
+      <button class="tab" data-tab="live">Rules</button>
+      <button class="tab active" data-tab="history">History</button>
+      <button class="tab" data-tab="usage">AI usage</button>
+    </div>
   </div>
   <div id="header-usage" class="hu" aria-label="AI usage" hidden></div>
   <div id="hu-pop" class="hu-pop" hidden></div>
