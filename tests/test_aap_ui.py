@@ -872,15 +872,24 @@ class AAPUITest(unittest.TestCase):
         # Every domain must be allowed, and nothing may be unresolved
         self.assertEqual(self._webrun("wr-4", {"open": [{"ref_id": "https://fitssey.com/"},
                                                         {"ref_id": "https://other.org/"}]})["status"], "pending")
-        self.assertEqual(self._webrun("wr-5", {"open": [{"ref_id": "https://fitssey.com/"},
-                                                        {"ref_id": "turn0search3"}]})["status"], "pending")
         self.assertEqual(self._webrun("wr-6", {"search_query": [{"q": "site:help.fitssey.com raporty"}]})["status"],
                          "approved")
         # A denied domain anywhere in the call denies it, even over a whole-tool allow
         self._req("POST", "/api/ui/rules", {"kind": "tool", "tool": "webrun", "action": "allow"})
         self.assertEqual(self._webrun("wr-7", {"open": [{"ref_id": "https://fitssey.com/"},
                                                         {"ref_id": "https://evil.example/?d=1"}]})["status"], "denied")
-        self.assertEqual(self._webrun("wr-8", {"open": [{"ref_id": "turn0search3"}]})["status"], "approved")
+        self.assertEqual(self._webrun("wr-8", {"open": [{"ref_id": "https://x.org/"}]})["status"], "approved")
+
+    def test_webrun_result_reference_denied(self) -> None:
+        self._req("POST", "/api/ui/rules", {"kind": "tool", "tool": "webrun", "action": "allow"})
+        r = self._webrun("wref-1", {"open": [{"ref_id": "https://x.org/"}, {"ref_id": "turn0search3"}],
+                                    "find": [{"ref_id": "turn0search3", "pattern": "a"}],
+                                    "search_query": [{"q": "no site"}]})
+        self.assertEqual(r["status"], "denied")
+        reason = r["decision"]["reason"]
+        self.assertIn(aap_ui.WEBRUN_SEARCH_REASON + '"no site"', reason)
+        self.assertIn(aap_ui.WEBRUN_REF_REASON + '"turn0search3"', reason)
+        self.assertNotIn("x.org", reason)
 
     def test_webrun_search_without_one_site_denied(self) -> None:
         # Denied ahead of rules, even a whole-tool allow

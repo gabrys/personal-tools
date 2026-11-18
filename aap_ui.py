@@ -547,19 +547,38 @@ WEBRUN_SEARCH_REASON = (
 )
 
 
-def webrun_search_error(tool: str, arguments: dict[str, Any]) -> str:
-    """Deny reason for a webrun call with a search query whose domain is
-    unknown (no `site:` or more than one), or "" if all queries name one."""
+WEBRUN_REF_REASON = (
+    "Open, find, click and screenshot need the page's full http(s) URL as "
+    "`ref_id`, not a result reference like turn0search3, so its domain can be "
+    "checked against the allowed domains. Take the URL from the search "
+    "results. Rejected ref_ids: "
+)
+
+
+def webrun_domain_error(tool: str, arguments: dict[str, Any]) -> str:
+    """Deny reason for a webrun call whose domain cannot be known: a search
+    query without exactly one `site:`, or a page op whose `ref_id` is not a
+    URL (e.g. turn0search3). "" when every part names its domain."""
     if tool != "webrun":
         return ""
-    bad: list[str] = []
-    for key in WEBRUN_QUERY_OPS:
-        items = arguments.get(key)
-        for item in items if isinstance(items, list) else []:
-            q = item.get("q") if isinstance(item, dict) else None
-            if not isinstance(q, str) or len(_SITE_OPERATOR.findall(q)) != 1:
-                bad.append(json.dumps(q, ensure_ascii=False))
-    return WEBRUN_SEARCH_REASON + ", ".join(bad) if bad else ""
+
+    def items(keys: tuple[str, ...]) -> list[dict[str, Any]]:
+        out = []
+        for key in keys:
+            val = arguments.get(key)
+            out += [i if isinstance(i, dict) else {} for i in (val if isinstance(val, list) else [])]
+        return out
+
+    bad_q = [i.get("q") for i in items(WEBRUN_QUERY_OPS)
+             if not isinstance(i.get("q"), str) or len(_SITE_OPERATOR.findall(i["q"])) != 1]
+    bad_ref = [i.get("ref_id") for i in items(WEBRUN_PAGE_OPS) if _url_host(i.get("ref_id")) is None]
+    fmt = lambda vals: ", ".join(dict.fromkeys(json.dumps(v, ensure_ascii=False) for v in vals))
+    reasons = []
+    if bad_q:
+        reasons.append(WEBRUN_SEARCH_REASON + fmt(bad_q))
+    if bad_ref:
+        reasons.append(WEBRUN_REF_REASON + fmt(bad_ref))
+    return "\n".join(reasons)
 
 
 def _domain_matches(pattern: str, host: str) -> bool:
@@ -1142,9 +1161,10 @@ class ApprovalHub:
                 except UnsupportedShell as exc:
                     shell_error = str(exc)
             sub_cmds = [part.text for part in shell_parts]
-            # A search with no single site: could reach any domain, which
-            # domain rules cannot check; it is denied ahead of every rule.
-            pre_deny = shell_error or webrun_search_error(tool, arguments)
+            # A webrun search with no single site:, or a page given by result
+            # reference instead of URL, reaches a domain the rules cannot
+            # check; it is denied ahead of every rule.
+            pre_deny = shell_error or webrun_domain_error(tool, arguments)
 
             subcommands: list[dict[str, Any]] = []
             if pre_deny:
