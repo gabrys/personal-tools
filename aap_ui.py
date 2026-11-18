@@ -2520,6 +2520,9 @@ function renderReviewBox(review, autoHtml = '') {
 // only after a review (its verdict is applied); other requests are accepted
 // for 12h (exact call). Typing a reason cancels the shown request's
 // auto-decision for good.
+// The Android app (User-Agent token "aap-ui-app/<version>") never
+// auto-decides: its WebView may run in the background, unseen.
+const IN_APP = /\\baap-ui-app\\//.test(navigator.userAgent);
 const AUTO_IDLE_MS = 10000;
 const AUTO_DECIDE_MS = 30000;
 const autoCancelled = new Set();
@@ -2550,7 +2553,7 @@ document.addEventListener('keydown', e => {
 });
 
 function autoAction(req, target, subIndex) {
-  if (req.status !== 'pending') return null;
+  if (IN_APP || req.status !== 'pending') return null;
   const base = req.id + '#' + (subIndex === null ? '' : subIndex);
   if (target.python_script != null) {
     const r = target.review;
