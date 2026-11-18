@@ -539,6 +539,29 @@ def extract_web_domains(tool: str, arguments: dict[str, Any]) -> tuple[list[str]
     return domains, unresolved
 
 
+WEBRUN_SEARCH_REASON = (
+    "Every web search must name exactly one site with a `site:` operator "
+    "(with a colon), e.g. `site:docs.python.org asyncio timeout`, so it can be "
+    "checked against the allowed domains. To search several sites, send a "
+    "separate query per site. Rejected queries: "
+)
+
+
+def webrun_search_error(tool: str, arguments: dict[str, Any]) -> str:
+    """Deny reason for a webrun call with a search query whose domain is
+    unknown (no `site:` or more than one), or "" if all queries name one."""
+    if tool != "webrun":
+        return ""
+    bad: list[str] = []
+    for key in WEBRUN_QUERY_OPS:
+        items = arguments.get(key)
+        for item in items if isinstance(items, list) else []:
+            q = item.get("q") if isinstance(item, dict) else None
+            if not isinstance(q, str) or len(_SITE_OPERATOR.findall(q)) != 1:
+                bad.append(json.dumps(q, ensure_ascii=False))
+    return WEBRUN_SEARCH_REASON + ", ".join(bad) if bad else ""
+
+
 def _domain_matches(pattern: str, host: str) -> bool:
     """`example.com` matches only that host; `*.example.com` matches it and
     every subdomain; other `*` wildcards match any characters."""
@@ -1119,11 +1142,14 @@ class ApprovalHub:
                 except UnsupportedShell as exc:
                     shell_error = str(exc)
             sub_cmds = [part.text for part in shell_parts]
+            # A search with no single site: could reach any domain, which
+            # domain rules cannot check; it is denied ahead of every rule.
+            pre_deny = shell_error or webrun_search_error(tool, arguments)
 
             subcommands: list[dict[str, Any]] = []
-            if shell_error:
+            if pre_deny:
                 status = "denied"
-                decision = {"status": status, "decided_at": now, "reason": shell_error}
+                decision = {"status": status, "decided_at": now, "reason": pre_deny}
             elif len(sub_cmds) > 1:
                 all_approved = True
                 any_denied: Rule | None = None

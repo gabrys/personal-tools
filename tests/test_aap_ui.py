@@ -872,15 +872,30 @@ class AAPUITest(unittest.TestCase):
         # Every domain must be allowed, and nothing may be unresolved
         self.assertEqual(self._webrun("wr-4", {"open": [{"ref_id": "https://fitssey.com/"},
                                                         {"ref_id": "https://other.org/"}]})["status"], "pending")
-        self.assertEqual(self._webrun("wr-5", {**page("https://fitssey.com/"),
-                                               "search_query": [{"q": "anything"}]})["status"], "pending")
+        self.assertEqual(self._webrun("wr-5", {"open": [{"ref_id": "https://fitssey.com/"},
+                                                        {"ref_id": "turn0search3"}]})["status"], "pending")
         self.assertEqual(self._webrun("wr-6", {"search_query": [{"q": "site:help.fitssey.com raporty"}]})["status"],
                          "approved")
         # A denied domain anywhere in the call denies it, even over a whole-tool allow
         self._req("POST", "/api/ui/rules", {"kind": "tool", "tool": "webrun", "action": "allow"})
         self.assertEqual(self._webrun("wr-7", {"open": [{"ref_id": "https://fitssey.com/"},
                                                         {"ref_id": "https://evil.example/?d=1"}]})["status"], "denied")
-        self.assertEqual(self._webrun("wr-8", {"search_query": [{"q": "x"}]})["status"], "approved")
+        self.assertEqual(self._webrun("wr-8", {"open": [{"ref_id": "turn0search3"}]})["status"], "approved")
+
+    def test_webrun_search_without_one_site_denied(self) -> None:
+        # Denied ahead of rules, even a whole-tool allow
+        self._req("POST", "/api/ui/rules", {"kind": "tool", "tool": "webrun", "action": "allow"})
+        r = self._webrun("ws-1", {"search_query": [{"q": "site:a.com ok"}, {"q": "site.b.com x"},
+                                                   {"q": "site:a.com site:b.com y"}]})
+        self.assertEqual(r["status"], "denied")
+        reason = r["decision"]["reason"]
+        self.assertTrue(reason.startswith(aap_ui.WEBRUN_SEARCH_REASON), reason)
+        self.assertIn('"site.b.com x"', reason)
+        self.assertIn('"site:a.com site:b.com y"', reason)
+        self.assertNotIn('"site:a.com ok"', reason)
+        ok = self._webrun("ws-2", {"search_query": [{"q": "site:a.com ok"}], "image_query": [{"q": "site:b.com x"}]})
+        self.assertEqual(ok["status"], "approved")
+        self.assertEqual(ok["domains"], ["a.com", "b.com"])
 
     def test_webrun_allow_domain_button(self) -> None:
         r = self._webrun("wrb-1", {"open": [{"ref_id": "https://developers.cloudflare.com/x"}]})
