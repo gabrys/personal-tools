@@ -33,6 +33,9 @@ DEFAULT_CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 DEFAULT_CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
 DEFAULT_ANTIGRAVITY_HOOKS = Path.home() / ".gemini" / "config" / "hooks.json"
 TERMINAL_STATUSES = {"approved", "denied", "expired", "cancelled"}
+# A Python script under AI review stays out of the queue (web UI and mobile
+# notifications) until the verdict is in, but at most this long.
+REVIEW_HIDE_SECONDS = 20.0
 UNSUPPORTED_SHELL_REASON = (
     "This command contains unsupported shell constructs. Rewrite it as a single "
     "python3 -c '…' command, or run several commands separately if that makes "
@@ -1096,7 +1099,7 @@ class ApprovalHub:
                 if target.get("python_script") is not None and target["status"] == "pending"
             ]
             if status == "pending" and python_targets:
-                record["ui_visible_after"] = received_at + 10.0
+                record["ui_visible_after"] = received_at + REVIEW_HIDE_SECONDS
                 reveal = threading.Timer(
                     max(0.0, record["ui_visible_after"] - time.time()),
                     lambda: self._reveal_request(req_id),

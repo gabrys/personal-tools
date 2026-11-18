@@ -136,12 +136,12 @@ class PythonRequestTests(unittest.TestCase):
                 self.assertEqual(self.hub.get_request(record["id"])["status"], "pending")
                 clock.return_value = 1005.0
                 self.request("#" * 201, key="same")
-                self.assertEqual(self.hub.get_request(record["id"])["ui_visible_after"], 1010.0)
-                clock.return_value = 1009.999
+                self.assertEqual(self.hub.get_request(record["id"])["ui_visible_after"], 1020.0)
+                clock.return_value = 1019.999
                 self.assertEqual(self.hub.ui_state()["pending"], [])
-                clock.return_value = 1010.0
+                clock.return_value = 1020.0
                 self.assertEqual(self.hub.ui_state()["pending"][0]["id"], record["id"])
-                self.assertEqual(timer.call_args.args[0], 10.0)
+                self.assertEqual(timer.call_args.args[0], 20.0)
                 subscriber = self.hub.subscribe()
                 timer.call_args.args[1]()
                 self.assertEqual(subscriber.get_nowait(), "update")
@@ -182,9 +182,9 @@ class PythonRequestTests(unittest.TestCase):
             try:
                 self.assertTrue(self.started.wait(1))
                 reloaded = aap_ui.ApprovalHub(self.rules)
-                clock.return_value = 1009.0
+                clock.return_value = 1019.0
                 self.assertEqual(reloaded.ui_state()["pending"], [])
-                clock.return_value = 1010.0
+                clock.return_value = 1020.0
                 self.assertEqual(reloaded.ui_state()["pending"][0]["id"], record["id"])
             finally:
                 self.finished.set()
