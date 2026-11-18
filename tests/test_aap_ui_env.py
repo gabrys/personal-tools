@@ -95,9 +95,9 @@ class CommandEnvironmentTests(unittest.TestCase):
                     with self.subTest(prefix=prefix):
                         self.assertEqual(shlex.split(prefix)[:3], required_words)
 
-    def test_inline_python_with_environment_assignments_or_arguments_is_rejected(self):
+    def test_reviewed_python_with_environment_assignments_or_arguments_is_rejected(self):
         # Review and the Python card see only the script, so nothing else may steer it.
-        script = shlex.quote('import os; print(os.environ["FOO"])')
+        script = shlex.quote('import os\n# 2\n# 3\nprint(os.environ["FOO"])')
         for command in (
             f"FOO=bar python3 -c {script}",
             f"FOO='two words' CI=1 python3 -I -c {script}",
@@ -113,10 +113,15 @@ class CommandEnvironmentTests(unittest.TestCase):
                     aap_ui.parse_shell_command(command)
                 self.assertEqual(str(ctx.exception), aap_ui.PYTHON_C_EXTRAS_REASON)
                 self.assertIsNone(aap_ui.extract_python_c_script(command))
+        short = shlex.quote('import os; print(os.environ["FOO"])')
         for command in (f"python3 -c {script}", f"timeout 5 python3 -I -c {script}",
-                        "FOO=bar python3 script.py arg", "python3 -m pytest -q"):
+                        "FOO=bar python3 script.py arg", "python3 -m pytest -q",
+                        # Short scripts are ordinary commands, shown and matched in full.
+                        f"FOO=bar python3 -c {short}", f"python3 -Ic {short} arg"):
             with self.subTest(command=command):
                 aap_ui.parse_shell_command(command)
+        self.assertEqual(aap_ui.extract_python_c_script(f"FOO=bar python3 -c {short}"),
+                         'import os; print(os.environ["FOO"])')
 
     def test_assignment_arguments_are_not_treated_as_environment_prefixes(self):
         self.assertIsNone(

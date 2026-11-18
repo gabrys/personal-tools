@@ -158,15 +158,16 @@ def parse_shell_command(command: str) -> list[ShellCommand]:
         nonlocal words, word_spans, assignments, has_redirect
         if len(words) <= assignments:
             raise UnsupportedShell(UNSUPPORTED_SHELL_REASON)
-        # Review and the Python card only see the script, so nothing else may
-        # steer it: no env assignments before python3 (also through `timeout`)
-        # and no arguments after the script.
+        # A reviewed script's review and Python card only see the script, so
+        # nothing else may steer it: no env assignments before python3 (also
+        # through `timeout`) and no arguments after the script. Short scripts
+        # are ordinary commands, shown and matched in full, so they may.
         starts = [assignments]
         if words[assignments] == "timeout":
             starts += [k for k in range(assignments + 1, len(words)) if words[k][:1].isalpha()][:1]
         for k in starts:
             parts = _python_c_parts(words[k:])
-            if parts is not None and (assignments or parts[1]):
+            if parts is not None and is_reviewable_python_script(parts[0]) and (assignments or parts[1]):
                 raise UnsupportedShell(PYTHON_C_EXTRAS_REASON)
         if len(words) > assignments and words[assignments] == "timeout":
             split_idx = next(
