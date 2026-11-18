@@ -92,4 +92,10 @@ systemctl --user link ~/git/personal-tools/systemd/aap-ui-tunnel.service
 systemctl --user enable --now aap-ui-tunnel.service
 ```
 
+Quick tunnels sometimes stop serving while `cloudflared` keeps running. The wrapper polls
+`<tunnel URL>/api/status` every 60 s ± 15 s. After 3 failed checks in a row (rechecked
+every 10 s), and only while the local `/api/status` still answers, it restarts `cloudflared`
+and posts the new URL. Tune with `--health-interval`, `--health-jitter`, `--health-failures`,
+or turn it off with `--health-path ''`.
+
 Run tests with `python3 -m unittest discover -s tests -v`.

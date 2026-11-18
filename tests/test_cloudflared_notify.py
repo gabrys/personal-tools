@@ -116,6 +116,136 @@ class NotifierTest(unittest.TestCase):
         self.assertFalse(old.is_alive())
 
 
+class StatusStub:
+    """Answers GET /api/status with the queued (status, body) pairs, then the last one."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        stub = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                status, body = stub.replies.pop(0) if len(stub.replies) > 1 else stub.replies[0]
+                data = body.encode()
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class CheckStatusTest(unittest.TestCase):
+    def test_ok_and_failures(self):
+        stub = StatusStub([(200, '{"status": "OK"}'), (200, '{"status": "DOWN"}'), (502, "bad gateway"),
+                           (200, "<html>")])
+        try:
+            self.assertIsNone(cloudflared_notify.check_status(stub.url + "/", "/api/status"))
+            self.assertIn("unexpected response", cloudflared_notify.check_status(stub.url, "/api/status"))
+            self.assertEqual(cloudflared_notify.check_status(stub.url, "api/status"), "HTTP 502 Bad Gateway")
+            self.assertEqual(cloudflared_notify.check_status(stub.url, "/api/status"), "response is not JSON")
+        finally:
+            stub.close()
+        self.assertIsNotNone(cloudflared_notify.check_status("http://127.0.0.1:9", "/api/status", timeout=2))
+
+
+class HealthWatcherTest(unittest.TestCase):
+    PUBLIC = "https://a-b.trycloudflare.com"
+    LOCAL = "http://127.0.0.1:8787"
+
+    def _watch(self, public_results, local_ok=True, failures=3):
+        calls = []
+        results = list(public_results)
+
+        def check(base, path):
+            calls.append((base, path))
+            if base == self.LOCAL:
+                return None if local_ok else "connection refused"
+            return results.pop(0) if results else None
+
+        dead = threading.Event()
+        w = cloudflared_notify.HealthWatcher(self.LOCAL, "/api/status", dead.set, interval=0.02, jitter=0.01,
+                                             failures=failures, check=check)
+        w.watch(self.PUBLIC)
+        return w, dead, calls
+
+    def test_restarts_after_consecutive_failures(self):
+        w, dead, calls = self._watch(["HTTP 530", "HTTP 530", "HTTP 530"])
+        self.assertTrue(dead.wait(5))
+        self.assertEqual(calls[0], (self.PUBLIC, "/api/status"))
+        self.assertIn((self.LOCAL, "/api/status"), calls)
+
+    def test_success_resets_the_count(self):
+        w, dead, calls = self._watch(["x", "x", None, "x", "x", None], failures=3)
+        time.sleep(0.5)
+        w.stop()
+        self.assertFalse(dead.is_set())
+
+    def test_local_outage_does_not_restart(self):
+        w, dead, calls = self._watch(["x"] * 20, local_ok=False, failures=2)
+        time.sleep(0.5)
+        w.stop()
+        self.assertFalse(dead.is_set())
+        self.assertGreater(len(calls), 4)
+
+
+FLAKY_CLOUDFLARED = """#!/usr/bin/env python3
+import pathlib, sys, time
+counter = pathlib.Path(sys.argv[0] + ".runs")
+n = int(counter.read_text()) + 1 if counter.exists() else 1
+counter.write_text(str(n))
+print(f"INF |  https://tunnel-{n}.trycloudflare.com  |", flush=True)
+time.sleep(30)
+"""
+
+
+class ReplaceTunnelTest(unittest.TestCase):
+    def test_dead_tunnel_is_replaced_and_new_url_posted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "cloudflared"
+            fake.write_text(FLAKY_CLOUDFLARED)
+            fake.chmod(0o755)
+            stub = NoteStub()
+            local = StatusStub([(200, '{"status": "OK"}')])
+            original = cloudflared_notify.check_status
+
+            def check(base, path, timeout=10.0):
+                # Tunnel 1 is dead; tunnel 2 and the local service are fine.
+                return "HTTP 530" if "tunnel-1." in base else original(base, path, timeout)
+
+            def stop_when_done():
+                stub.wait_posts(2, timeout=10)
+                os.kill(os.getpid(), signal.SIGTERM)
+
+            old_term, old_int = signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)
+            cloudflared_notify.check_status = check
+            threading.Thread(target=stop_when_done, daemon=True).start()
+            try:
+                code = cloudflared_notify.main([
+                    "--url", local.url, "--post-url", stub.url, "--cloudflared", str(fake),
+                    "--health-interval", "0.05", "--health-jitter", "0", "--health-failures", "2",
+                ])
+            finally:
+                cloudflared_notify.check_status = original
+                signal.signal(signal.SIGTERM, old_term)
+                signal.signal(signal.SIGINT, old_int)
+                stub.close()
+                local.close()
+            self.assertEqual(code, 0)
+            self.assertEqual([p[3] for p in stub.posts[:2]],
+                             [b"https://tunnel-1.trycloudflare.com\n", b"https://tunnel-2.trycloudflare.com\n"])
+            self.assertEqual((Path(tmp) / "cloudflared.runs").read_text(), "2")
+
+
 class MainTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
