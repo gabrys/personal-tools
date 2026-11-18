@@ -313,6 +313,21 @@ class AAPUITest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body, {"status": "OK"})
 
+    def test_mobile_notification_lists_requests_awaiting_a_decision(self) -> None:
+        self.assertEqual(self._req("GET", "/api/mobile/notification"), (200, []))
+        self.assertEqual(
+            aap_ui.mobile_notifications([
+                {"id": "a", "status": "pending", "tool": "Bash", "arguments": {"command": "git push"},
+                 "context": {"runtime": "claude-code"}},
+                {"id": "b", "status": "pending", "tool": "Edit", "arguments": {"file_path": "/x/y.py"}},
+                {"id": "c", "status": "expired", "tool": "Bash", "arguments": {"command": "ls"}},
+            ]),
+            [
+                {"id": "a", "title": "claude-code: run", "text": "git push"},
+                {"id": "b", "title": "agent: Edit", "text": "/x/y.py"},
+            ],
+        )
+
     def test_tab_urls_serve_the_ui(self) -> None:
         for path in ("/", "/rules", "/history", "/ai-usage"):
             with urllib.request.urlopen(f"{self.base_url}{path}", timeout=5.0) as resp:

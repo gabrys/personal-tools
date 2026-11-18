@@ -457,6 +457,24 @@ def _rule_path_level(rule: "Rule") -> str:
 # Tools that run a shell command line (Claude Code/Codex, Antigravity).
 SHELL_TOOLS = {"Bash", "run_command"}
 
+
+def mobile_notifications(pending: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Notifications for the Android app: one per request awaiting a decision.
+    The app shows new ids, updates known ones and dismisses ids that are gone."""
+    out = []
+    for req in pending:
+        if req.get("status") != "pending":
+            continue
+        args = req.get("arguments") or {}
+        runtime = (req.get("context") or {}).get("runtime") or "agent"
+        tool = "run" if req.get("tool") in SHELL_TOOLS else str(req.get("tool"))
+        text = args.get("command") or args.get("CommandLine")
+        if not isinstance(text, str):
+            path = args.get("file_path") or args.get("path") or args.get("Path")
+            text = path if isinstance(path, str) else json.dumps(args, ensure_ascii=False)
+        out.append({"id": req["id"], "title": f"{runtime}: {tool}", "text": text})
+    return out
+
 # Where a decision came from, stored as decision["labels"] (in this order):
 #   rule      - an existing permanent rule matched
 #   prior     - an earlier Accept (12h exact-call rule) matched
@@ -2996,6 +3014,10 @@ def make_handler(
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                return
+
+            if path == "/api/mobile/notification":
+                self._send_json(HTTPStatus.OK, mobile_notifications(hub.ui_state()["pending"]))
                 return
 
             if path == "/api/status":
