@@ -82,3 +82,39 @@ class SummaryTests(unittest.TestCase):
             'Weekly', 50, now + dt.timedelta(days=3.5), duration=usage.ONE_WEEK
         )
         self.assertAlmostEqual(w7.expected(now), 50.0)
+
+    def test_failed_fetch_falls_back_to_history_within_12_minutes(self):
+        t0 = dt.datetime(2026, 11, 15, 12, 0, tzinfo=dt.timezone.utc)
+        good = usage.ProviderResult('Codex', 'test', groups=[
+            usage.UsageGroup('Codex', [
+                usage.UsageWindow('5h', 25, t0 + usage.FIVE_HOURS,
+                                  duration=usage.FIVE_HOURS),
+            ]),
+        ])
+        failed = usage.ProviderResult('Codex', 'test', error='timeout')
+
+        with patch.dict(usage._HISTORY, {}, clear=True):
+            with patch.dict(usage.FETCHERS, {'codex': lambda: good}):
+                data0 = usage.usage_data(only='codex', now=t0)
+            self.assertIsNone(data0['providers']['codex']['error'])
+            self.assertEqual(
+                data0['providers']['codex']['groups'][0]['windows'][0]['used_percent'],
+                25,
+            )
+
+            # 12 minutes later: failed fetch still returns the historical data.
+            t1 = t0 + dt.timedelta(minutes=12)
+            with patch.dict(usage.FETCHERS, {'codex': lambda: failed}):
+                data1 = usage.usage_data(only='codex', now=t1)
+            self.assertIsNone(data1['providers']['codex']['error'])
+            self.assertEqual(
+                data1['providers']['codex']['groups'][0]['windows'][0]['used_percent'],
+                25,
+            )
+
+            # More than 12 minutes later: historical data is too old, error is shown.
+            t2 = t0 + dt.timedelta(minutes=12, seconds=1)
+            with patch.dict(usage.FETCHERS, {'codex': lambda: failed}):
+                data2 = usage.usage_data(only='codex', now=t2)
+            self.assertEqual(data2['providers']['codex']['error'], 'timeout')
+            self.assertEqual(data2['providers']['codex']['groups'], [])

@@ -45,6 +45,7 @@ FIVE_HOURS = dt.timedelta(hours=5)
 SIX_HOURS = dt.timedelta(hours=6)
 FIVE_HOUR_SHIFT = dt.timedelta(minutes=15)
 ONE_WEEK = dt.timedelta(days=7)
+STALE_MAX_AGE = dt.timedelta(minutes=12)
 
 ANSI = {
     "reset": "\033[0m",
@@ -703,8 +704,12 @@ AGENT_SHORT_NAMES = {
 # then "|", then this many furthest below.
 SUMMARY_EXTREMES = 2
 
+# Last successful result per provider: name -> (fetched_at, ProviderResult).
+_HISTORY = {}
+_HISTORY_LOCK = threading.Lock()
 
-def collect(only=None):
+
+def collect(only=None, now=None):
     """
     Fetch providers concurrently.
 
@@ -742,6 +747,20 @@ def collect(only=None):
                     source="unknown",
                     error=str(exc),
                 )
+
+    now = now or now_local()
+
+    with _HISTORY_LOCK:
+        for name, result in list(results.items()):
+            if not result.error and result.groups:
+                _HISTORY[name] = (now, result)
+            else:
+                cached = _HISTORY.get(name)
+                if (
+                    cached is not None
+                    and now - cached[0] <= STALE_MAX_AGE
+                ):
+                    results[name] = cached[1]
 
     return results
 
@@ -1366,10 +1385,10 @@ def usage_data(only=None, now=None, results=None):
     as is and the TUI renders it. `results` skips the fetch
     (for tests).
     """
-    if results is None:
-        results = collect(only)
-
     now = now or now_local()
+
+    if results is None:
+        results = collect(only, now=now)
 
     def iso(value):
         return value.isoformat() if value else None

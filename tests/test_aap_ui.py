@@ -309,6 +309,65 @@ class AAPUITest(unittest.TestCase):
         self.assertEqual(snap["error"], "boom")
         self.assertIsNone(snap["data"])
 
+    def test_usage_cache_falls_back_to_history_within_12_minutes(self) -> None:
+        state = {"fail": False, "provider_error": False}
+
+        def fake_fetch():
+            if state["fail"]:
+                raise RuntimeError("boom")
+            if state["provider_error"]:
+                return {
+                    "providers": {"codex": {"name": "Codex", "error": "timeout", "groups": []}},
+                    "agents": {"codex": None},
+                }
+            return {
+                "providers": {
+                    "codex": {
+                        "name": "Codex",
+                        "error": None,
+                        "groups": [{"name": "Codex", "windows": [{"label": "5h", "used_percent": 42}]}],
+                    }
+                },
+                "agents": {"codex": 12.0},
+            }
+
+        cache = aap_ui.UsageCache(fetch=fake_fetch, interval=60, max_stale=720)
+        cache._started = time.monotonic()
+        cache._refresh()
+        snap0 = cache.snapshot()
+        self.assertIsNone(snap0["error"])
+        self.assertEqual(snap0["data"]["providers"]["codex"]["groups"][0]["windows"][0]["used_percent"], 42)
+
+        # Provider-level failure within 12 minutes keeps historical provider data.
+        state["provider_error"] = True
+        cache._refresh()
+        snap1 = cache.snapshot()
+        self.assertIsNone(snap1["error"])
+        self.assertIsNone(snap1["data"]["providers"]["codex"]["error"])
+        self.assertEqual(snap1["data"]["providers"]["codex"]["groups"][0]["windows"][0]["used_percent"], 42)
+        self.assertEqual(snap1["data"]["agents"]["codex"], 12.0)
+
+        # Whole-fetch exception within 12 minutes also keeps historical data without error.
+        state["fail"] = True
+        cache._refresh()
+        snap2 = cache.snapshot()
+        self.assertIsNone(snap2["error"])
+        self.assertEqual(snap2["data"]["providers"]["codex"]["groups"][0]["windows"][0]["used_percent"], 42)
+
+        # Once historical data is older than 12 minutes, errors are reported.
+        cache._data_ts -= 721
+        cache._providers["codex"] = (cache._providers["codex"][0] - 721, cache._providers["codex"][1])
+        state["fail"] = False
+        cache._refresh()
+        snap3 = cache.snapshot()
+        self.assertEqual(snap3["data"]["providers"]["codex"]["error"], "timeout")
+
+        state["fail"] = True
+        cache._refresh()
+        snap4 = cache.snapshot()
+        self.assertEqual(snap4["error"], "boom")
+        self.assertIsNone(snap4["data"])
+
     def test_status_endpoint(self) -> None:
         status, body = self._req("GET", "/api/status")
         self.assertEqual(status, 200)

@@ -1503,6 +1503,7 @@ class ApprovalHub:
 
 
 USAGE_REFRESH_SECONDS = 30.0
+USAGE_MAX_STALE_SECONDS = 12 * 60.0
 
 
 def fetch_ai_usage() -> dict[str, Any]:
@@ -1525,11 +1526,20 @@ class UsageCache:
     fetch; a stale snapshot() also kicks off a refresh.
     """
 
-    def __init__(self, fetch: Any = None, interval: float = USAGE_REFRESH_SECONDS) -> None:
+    def __init__(
+        self,
+        fetch: Any = None,
+        interval: float = USAGE_REFRESH_SECONDS,
+        max_stale: float = USAGE_MAX_STALE_SECONDS,
+    ) -> None:
         self._fetch = fetch or fetch_ai_usage
         self.interval = interval
+        self.max_stale = max_stale
         self._lock = threading.Lock()
         self._data: dict[str, Any] | None = None
+        self._data_ts: float | None = None
+        self._providers: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._agents: dict[str, tuple[float, float | None]] = {}
         self._error: str | None = None
         self._updated_at: str | None = None
         self._started: float | None = None
@@ -1563,11 +1573,50 @@ class UsageCache:
             data, error = self._fetch(), None
         except Exception as exc:  # noqa: BLE001 - shown in the UI
             data, error = None, str(exc) or exc.__class__.__name__
+        now = time.monotonic()
         with self._lock:
             if data is not None:
+                providers = data.get("providers")
+                has_fresh = not isinstance(providers, dict) or not providers
+                if isinstance(providers, dict):
+                    merged_providers = dict(providers)
+                    for key, prov in list(merged_providers.items()):
+                        if not isinstance(prov, dict):
+                            continue
+                        if not prov.get("error") and prov.get("groups"):
+                            self._providers[key] = (now, prov)
+                            has_fresh = True
+                        else:
+                            cached = self._providers.get(key)
+                            if cached is not None and now - cached[0] <= self.max_stale:
+                                merged_providers[key] = cached[1]
+                    data = {**data, "providers": merged_providers}
+                agents = data.get("agents")
+                if isinstance(agents, dict):
+                    merged_agents = dict(agents)
+                    for agent, score in list(merged_agents.items()):
+                        if score is not None:
+                            self._agents[agent] = (now, score)
+                        else:
+                            cached_agent = self._agents.get(agent)
+                            if cached_agent is not None and now - cached_agent[0] <= self.max_stale:
+                                merged_agents[agent] = cached_agent[1]
+                    data = {**data, "agents": merged_agents}
                 self._data = data
-            self._error = error
-            self._updated_at = utc_now_iso()
+                if has_fresh:
+                    self._data_ts = now
+                self._error = None
+                self._updated_at = utc_now_iso()
+            elif (
+                self._data is not None
+                and self._data_ts is not None
+                and now - self._data_ts <= self.max_stale
+            ):
+                self._error = None
+            else:
+                self._data = None
+                self._error = error
+                self._updated_at = utc_now_iso()
             self._fetching = False
 
 
