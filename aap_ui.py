@@ -1529,6 +1529,8 @@ UI_HTML = """<!doctype html>
   body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); }
   header { display: flex; align-items: center; justify-content: flex-start; gap: 20px; padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--card); position: sticky; top: 0; z-index: 10; }
   header h1 { margin: 0; font-size: 16px; display: flex; align-items: center; gap: 10px; }
+  .offline-dot { flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--red-h); box-shadow: 0 0 0 3px rgba(248, 81, 73, 0.25); }
+  .offline-dot[hidden] { display: none; }
   .badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #21262d; color: var(--muted); }
   .badge.pending { background: rgba(210, 153, 34, 0.2); color: var(--amber); }
   .tabs { display: flex; gap: 8px; }
@@ -1729,6 +1731,7 @@ UI_HTML = """<!doctype html>
 <body>
 <header>
   <h1>aap-ui</h1>
+  <span id="offline-dot" class="offline-dot" role="status" title="aap-ui is offline" aria-label="aap-ui is offline" hidden></span>
   <div class="tabs">
     <button class="tab" data-tab="live">Rules</button>
     <button class="tab active" data-tab="history">History</button>
@@ -2905,8 +2908,26 @@ function render() {
 
 setTab(tabFromPath(), false);
 fetchState();
+// Red dot in the header while GET /api/status does not answer OK.
+let statusChecking = false;
+async function checkStatus() {
+  if (statusChecking) return;
+  statusChecking = true;
+  let online = false;
+  try {
+    const res = await fetch('/api/status', { cache: 'no-store', signal: AbortSignal.timeout(2500) });
+    online = res.ok && (await res.json()).status === 'OK';
+  } catch (e) { /* offline */ }
+  statusChecking = false;
+  document.getElementById('offline-dot').hidden = online;
+}
+checkStatus();
+setInterval(checkStatus, 3000);
+
 const ev = new EventSource('/api/ui/events');
 ev.onmessage = () => fetchState();
+ev.onerror = () => checkStatus();
+ev.onopen = () => checkStatus();
 setInterval(fetchState, 5000);
 // The server refetches at most every 30 s; polling often only picks up
 // a finished refresh sooner.
