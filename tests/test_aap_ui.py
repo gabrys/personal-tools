@@ -7,6 +7,7 @@ import threading
 import time
 import tomllib
 import unittest
+from datetime import datetime, timezone
 import urllib.error
 import urllib.request
 
@@ -315,18 +316,42 @@ class AAPUITest(unittest.TestCase):
 
     def test_mobile_notification_lists_requests_awaiting_a_decision(self) -> None:
         self.assertEqual(self._req("GET", "/api/mobile/notification"), (200, []))
-        self.assertEqual(
-            aap_ui.mobile_notifications([
-                {"id": "a", "status": "pending", "tool": "Bash", "arguments": {"command": "git push"},
-                 "context": {"runtime": "claude-code"}},
+        cc = {"runtime": "claude-code"}
+        long_cmd = "echo " + "x" * 100
+        now = 1_800_000_000.0
+        at = lambda ago: datetime.fromtimestamp(now - ago, timezone.utc).isoformat().replace("+00:00", "Z")
+        state = {
+            "pending": [
+                {"id": "a", "status": "pending", "tool": "Bash", "arguments": {"command": "git push\ngit log"},
+                 "context": cc},
                 {"id": "b", "status": "pending", "tool": "Edit", "arguments": {"file_path": "/x/y.py"}},
                 {"id": "c", "status": "expired", "tool": "Bash", "arguments": {"command": "ls"}},
-            ]),
-            [
-                {"id": "a", "title": "claude-code: run", "text": "git push"},
-                {"id": "b", "title": "agent: Edit", "text": "/x/y.py"},
+                {"id": "d", "status": "pending", "tool": "Bash", "arguments": {"command": long_cmd}, "context": cc},
+                {"id": "e", "status": "pending", "tool": "Bash", "arguments": {"command": "python3 -c ..."},
+                 "context": cc, "python_script": "a\nb\nc\nd",
+                 "review": {"status": "done", "explanation": "Lists files. It changes nothing."}},
             ],
-        )
+            "history": [
+                {"id": "f", "status": "approved", "tool": "Bash", "arguments": {"command": "ls"}, "context": cc,
+                 "decision": {"decided_at": at(60), "labels": ["lazy"]}},
+                {"id": "g", "status": "denied", "tool": "Bash", "arguments": {"command": "rm x"}, "context": cc,
+                 "decision": {"decided_at": at(60), "labels": ["ai-review", "lazy"]}},
+                {"id": "h", "status": "approved", "tool": "Bash", "arguments": {"command": "ls"},
+                 "decision": {"decided_at": at(60), "labels": ["click"]}},
+                {"id": "i", "status": "approved", "tool": "Bash", "arguments": {"command": "ls"},
+                 "decision": {"decided_at": at(2 * 3600), "labels": ["lazy"]}},
+                {"id": "j", "status": "approved", "tool": "Bash", "arguments": {"command": "ls"},
+                 "decision": {"decided_at": at(60), "labels": ["rule"]}},
+            ],
+        }
+        self.assertEqual(aap_ui.mobile_notifications(state, now=now), [
+            {"id": "a", "title": "claude-code run: waiting", "text": "git push…"},
+            {"id": "b", "title": "agent Edit: waiting", "text": "/x/y.py"},
+            {"id": "d", "title": "claude-code run: waiting", "text": long_cmd[:79] + "…"},
+            {"id": "e", "title": "claude-code Python: waiting", "text": "Lists files"},
+            {"id": "f", "title": "claude-code run: auto-approved", "text": "ls"},
+            {"id": "g", "title": "claude-code run: auto-denied", "text": "rm x"},
+        ])
 
     def test_extract_python_c_script_forms(self) -> None:
         ex = aap_ui.extract_python_c_script

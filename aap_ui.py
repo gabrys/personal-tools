@@ -468,22 +468,59 @@ def _rule_path_level(rule: "Rule") -> str:
 SHELL_TOOLS = {"Bash", "run_command"}
 
 
-def mobile_notifications(pending: list[dict[str, Any]]) -> list[dict[str, str]]:
-    """Notifications for the Android app: one per request awaiting a decision.
-    The app shows new ids, updates known ones and dismisses ids that are gone."""
+MOBILE_TEXT_CHARS = 80
+MOBILE_AUTO_KEEP_SECONDS = 3600.0  # how long auto-decided requests stay listed
+
+
+def _one_line(text: str, limit: int = MOBILE_TEXT_CHARS) -> str:
+    line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    if line != text.strip() or len(line) > limit:
+        line = line[: limit - 1].rstrip() + "…"
+    return line
+
+
+def _mobile_text(req: dict[str, Any]) -> str:
+    """One short line: the AI review's summary for Python, else the command or path."""
+    review = req.get("review") or {}
+    if req.get("python_script") is not None:
+        if review.get("explanation"):
+            return _one_line(review["explanation"].split(". ")[0])
+        return f"{len(req['python_script'].splitlines())}-line script"
+    args = req.get("arguments") or {}
+    text = args.get("command") or args.get("CommandLine")
+    if not isinstance(text, str):
+        path = args.get("file_path") or args.get("path") or args.get("Path")
+        text = path if isinstance(path, str) else json.dumps(args, ensure_ascii=False)
+    return _one_line(text)
+
+
+def mobile_notifications(state: dict[str, Any], now: float | None = None) -> list[dict[str, str]]:
+    """Notifications for the Android app; it shows new ids, updates known ones
+    and dismisses ids that are gone. Requests awaiting a decision are listed;
+    a manual decision drops them, an automatic one (the UI's countdown) turns
+    them into "auto-approved"/"auto-denied" for MOBILE_AUTO_KEEP_SECONDS."""
+    now = time.time() if now is None else now
     out = []
-    for req in pending:
-        if req.get("status") != "pending":
+    for req in state.get("pending", []):
+        if req.get("status") == "pending":
+            out.append({"id": req["id"], "title": f"{_mobile_who(req)}: waiting", "text": _mobile_text(req)})
+    for req in state.get("history", []):
+        d = req.get("decision") or {}
+        labels = d.get("labels") or []
+        if "lazy" not in labels or "click" in labels or not d.get("decided_at"):
             continue
-        args = req.get("arguments") or {}
-        runtime = (req.get("context") or {}).get("runtime") or "agent"
-        tool = "run" if req.get("tool") in SHELL_TOOLS else str(req.get("tool"))
-        text = args.get("command") or args.get("CommandLine")
-        if not isinstance(text, str):
-            path = args.get("file_path") or args.get("path") or args.get("Path")
-            text = path if isinstance(path, str) else json.dumps(args, ensure_ascii=False)
-        out.append({"id": req["id"], "title": f"{runtime}: {tool}", "text": text})
+        decided = datetime.fromisoformat(d["decided_at"].replace("Z", "+00:00")).timestamp()
+        if now - decided <= MOBILE_AUTO_KEEP_SECONDS:
+            out.append({"id": req["id"], "title": f"{_mobile_who(req)}: auto-{req['status']}",
+                        "text": _mobile_text(req)})
     return out
+
+
+def _mobile_who(req: dict[str, Any]) -> str:
+    runtime = (req.get("context") or {}).get("runtime") or "agent"
+    if req.get("python_script") is not None:
+        return f"{runtime} Python"
+    return f"{runtime} {'run' if req.get('tool') in SHELL_TOOLS else req.get('tool')}"
 
 # Where a decision came from, stored as decision["labels"] (in this order):
 #   rule      - an existing permanent rule matched
@@ -3027,7 +3064,7 @@ def make_handler(
                 return
 
             if path == "/api/mobile/notification":
-                self._send_json(HTTPStatus.OK, mobile_notifications(hub.ui_state()["pending"]))
+                self._send_json(HTTPStatus.OK, mobile_notifications(hub.ui_state()))
                 return
 
             if path == "/api/status":
