@@ -335,7 +335,10 @@ class AAPUITest(unittest.TestCase):
         self.assertEqual(ex("python3 -Ic 'print(1)'"), "print(1)")
         self.assertEqual(ex("/usr/bin/python3.12 -Ic 'print(1)'"), "print(1)")
         for cmd in ("python3 -c", "python3 -I 'print(1)'", "python3 -I -I -c 'x'", "python3 -cI 'x'",
-                    "python3 -u -c 'x'", "python3 script.py", "node -c 'x'"):
+                    "python3 -u -c 'x'", "python3 script.py", "node -c 'x'",
+                    # Trailing args and env assignments would be invisible to review.
+                    "python3 -c 'x' /etc/passwd", "python3 -Ic 'x' --", "LD_PRELOAD=/tmp/x.so python3 -c 'x'",
+                    "PYTHONPATH=/tmp python3 -I -c 'x'"):
             self.assertIsNone(ex(cmd), cmd)
 
     def test_tab_urls_serve_the_ui(self) -> None:

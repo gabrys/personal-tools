@@ -240,7 +240,11 @@ def split_compound_command(command: str) -> list[str]:
 
 def extract_python_c_script(command: str) -> str | None:
     """Return the inline script if command is `python[3] -c '<script>'`,
-    optionally isolated: `python3 -I -c '<script>'` or `python3 -Ic '<script>'`."""
+    optionally isolated: `python3 -I -c '<script>'` or `python3 -Ic '<script>'`.
+
+    Env assignments before it or arguments after the script make it an
+    ordinary command: review and the Python card see only the script, so
+    anything else that steers it would go unseen."""
     text = command.strip()
     if not text:
         return None
@@ -249,17 +253,17 @@ def extract_python_c_script(command: str) -> str | None:
         if len(parts) != 1:
             return None
         part = parts[0]
-        tokens = part.words[part.assignments:]
+        tokens = part.words
     except ValueError:
         return None
-    if not tokens or not re.match(r"^python3?(?:\.\d+)*$", Path(tokens[0]).name):
+    if part.assignments or not tokens or not re.match(r"^python3?(?:\.\d+)*$", Path(tokens[0]).name):
         return None
     rest = tokens[1:]
     if rest[:1] == ["-I"]:
         rest = rest[1:]
     elif rest[:1] == ["-Ic"]:
         rest = ["-c", *rest[1:]]
-    if len(rest) < 2 or rest[0] != "-c":
+    if len(rest) != 2 or rest[0] != "-c":
         return None
     return rest[1]
 
