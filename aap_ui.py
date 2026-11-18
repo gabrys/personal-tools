@@ -1529,8 +1529,9 @@ UI_HTML = """<!doctype html>
   body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); }
   header { display: flex; align-items: center; justify-content: flex-start; gap: 20px; padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--card); position: sticky; top: 0; z-index: 10; }
   header h1 { margin: 0; font-size: 16px; display: flex; align-items: center; gap: 10px; }
-  .offline-dot { flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--red-h); box-shadow: 0 0 0 3px rgba(248, 81, 73, 0.25); }
-  .offline-dot[hidden] { display: none; }
+  .status-dot { flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--red-h); box-shadow: 0 0 0 3px rgba(248, 81, 73, 0.25); }
+  .status-dot.online { background: var(--green-h); box-shadow: 0 0 0 3px rgba(46, 160, 67, 0.25); }
+  .status-dot[hidden] { display: none; }
   .badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #21262d; color: var(--muted); }
   .badge.pending { background: rgba(210, 153, 34, 0.2); color: var(--amber); }
   .tabs { display: flex; gap: 8px; }
@@ -1731,7 +1732,7 @@ UI_HTML = """<!doctype html>
 <body>
 <header>
   <h1>aap-ui</h1>
-  <span id="offline-dot" class="offline-dot" role="status" title="aap-ui is offline" aria-label="aap-ui is offline" hidden></span>
+  <span id="status-dot" class="status-dot" role="status" hidden></span>
   <div class="tabs">
     <button class="tab" data-tab="live">Rules</button>
     <button class="tab active" data-tab="history">History</button>
@@ -2908,7 +2909,7 @@ function render() {
 
 setTab(tabFromPath(), false);
 fetchState();
-// Red dot in the header while GET /api/status does not answer OK.
+// Header dot: green while GET /api/status answers OK, red otherwise.
 let statusChecking = false;
 async function checkStatus() {
   if (statusChecking) return;
@@ -2919,7 +2920,12 @@ async function checkStatus() {
     online = res.ok && (await res.json()).status === 'OK';
   } catch (e) { /* offline */ }
   statusChecking = false;
-  document.getElementById('offline-dot').hidden = online;
+  const dot = document.getElementById('status-dot');
+  const label = online ? 'aap-ui is online' : 'aap-ui is offline';
+  dot.classList.toggle('online', online);
+  dot.title = label;
+  dot.setAttribute('aria-label', label);
+  dot.hidden = false;
 }
 checkStatus();
 setInterval(checkStatus, 3000);
