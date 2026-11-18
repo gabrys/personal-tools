@@ -1986,11 +1986,15 @@ function hideUsagePopover() {
   document.getElementById('hu-pop').hidden = true;
 }
 
-document.getElementById('header-usage').addEventListener('mouseover', e => {
+// Only a real mouse hovers: touch browsers fake mouseover on tap, which would
+// pop the table up instead of acting as the click (open the AI usage tab).
+document.getElementById('header-usage').addEventListener('pointerover', e => {
+  if (e.pointerType !== 'mouse') return;
   const meter = e.target.closest('.hu-meter');
   if (meter && meter !== huPopAnchor) showUsagePopover(meter.dataset.provider, meter.dataset.group, meter);
 });
-document.getElementById('header-usage').addEventListener('mouseout', e => {
+document.getElementById('header-usage').addEventListener('pointerout', e => {
+  if (e.pointerType !== 'mouse') return;
   const to = e.relatedTarget;
   if (!to || !to.closest || !to.closest('.hu-meter')) hideUsagePopover();
 });
