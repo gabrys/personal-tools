@@ -318,8 +318,9 @@ class AAPUITest(unittest.TestCase):
             with urllib.request.urlopen(f"{self.base_url}{path}", timeout=5.0) as resp:
                 self.assertEqual(resp.status, 200)
                 self.assertIn("<h1>aap-ui</h1>", resp.read().decode("utf-8"))
-        with self.assertRaises(urllib.error.HTTPError):
-            urllib.request.urlopen(f"{self.base_url}/nope", timeout=5.0)
+        for path in ("/nope", "/test"):
+            with self.assertRaises(urllib.error.HTTPError):
+                urllib.request.urlopen(f"{self.base_url}{path}", timeout=5.0)
 
     def test_restart_endpoint(self) -> None:
         called = threading.Event()
@@ -330,7 +331,7 @@ class AAPUITest(unittest.TestCase):
         t.start()
         try:
             req = urllib.request.Request(
-                f"http://127.0.0.1:{srv.server_address[1]}/api/ui/restart",
+                f"http://127.0.0.1:{srv.server_address[1]}/api/restart",
                 data=b"{}",
                 headers={"Content-Type": "application/json"},
                 method="POST",
@@ -819,32 +820,6 @@ class AAPUITest(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._req("POST", f"/api/ui/requests/{non_py['id']}/review", {})
         self.assertEqual(ctx.exception.code, 400)
-
-    def test_python_test_endpoint_is_dry_run(self) -> None:
-        self.hub.review_cmd = [
-            sys.executable,
-            "-c",
-            "import json, sys; s = sys.stdin.read(); print(json.dumps({'decision': 'accept', 'explanation': 'Prints a value.', 'deny_reason': ''} if 'LGTM' in s else {'decision': 'reject', 'explanation': 'Assigns a password.', 'deny_reason': \"Remove the password; read it from the environment instead.\"}))",
-        ]
-        status, ok = self._req("POST", "/api/ui/test", {"script": "print('x') # LGTM"})
-        self.assertEqual(status, 200)
-        self.assertEqual(ok["decision"], "approved")
-        self.assertEqual(ok["stage"], "review · claude")
-        self.assertEqual(ok["command"], "python3 -c 'print('\"'\"'x'\"'\"') # LGTM'")
-
-        _, bad = self._req("POST", "/api/ui/test", {"script": "PASSWORD=123"})
-        self.assertEqual(bad["decision"], "denied")
-        self.assertEqual(bad["explanation"], "Assigns a password.")
-        self.assertEqual(bad["reason"], bad["deny_reason"])
-        self.assertEqual(bad["reason"], "Remove the password; read it from the environment instead. " + aap_ui.SIMPLE_SCRIPT_HINT)
-
-        with self.assertRaises(urllib.error.HTTPError) as ctx:
-            self._req("POST", "/api/ui/test", {"script": "  "})
-        self.assertEqual(ctx.exception.code, 400)
-
-        _, ui_state = self._req("GET", "/api/ui/state")
-        self.assertEqual(ui_state["pending"], [])
-        self.assertEqual(ui_state["history"], [])
 
     def test_decision_labels(self) -> None:
         def create(cmd: str, key: str) -> dict:

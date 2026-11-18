@@ -1378,28 +1378,6 @@ class ApprovalHub:
         threading.Thread(target=_finish, daemon=True).start()
         return self._public_view(record)
 
-    def test_python_script(self, script: str, tool: str = "Bash") -> dict[str, Any]:
-        """Dry-run `python3 -c '<script>'` through parsing, deny rules and
-        auto-review without queueing it or touching history."""
-        command = "python3 -c " + shlex.quote(script)
-        result: dict[str, Any] = {"command": command, "tool": tool}
-        try:
-            parse_shell_command(command)
-        except UnsupportedShell as exc:
-            return {**result, "decision": "denied", "stage": "shell", "reason": str(exc)}
-        if extract_python_c_script(command) != script:
-            return {**result, "decision": "denied", "stage": "shell",
-                    "reason": "Command was not recognized as a python3 -c script"}
-        rule = self.rules.match(tool, {"command": command}, record_hit=False)
-        if rule is not None and rule.action == "deny":
-            return {**result, "decision": "denied", "stage": "rule",
-                    "reason": rule_decision_reason(rule), "rule_id": rule.id}
-        agent, agent_why = self._pick_review_agent("")
-        verdict = run_python_review([*self.review_cmd, "--agent", agent], script)
-        return {**result, **verdict, "stage": f"review · {agent}",
-                "reason": verdict["deny_reason"] or verdict["explanation"],
-                "agent": agent, "agent_reason": agent_why}
-
     def _pick_review_agent(self, runtime: str) -> tuple[str, str]:
         data = self.usage.snapshot().get("data") if self.usage is not None else None
         return choose_review_agent(runtime, data)
@@ -1561,8 +1539,6 @@ UI_HTML = """<!doctype html>
   body { padding-bottom: var(--queue-bar-height); transition: padding-bottom 180ms ease; }
   /* --queue-panel-height is the measured panel height (ResizeObserver). */
   body.has-queue { padding-bottom: var(--queue-panel-height, var(--queue-min-height)); }
-  body.queue-hidden, body.has-queue.queue-hidden { padding-bottom: 0; transition: none; }
-  .queue-hidden .queue-panel { display: none; }
   .queue-panel { position: fixed; inset: auto 0 0; height: var(--queue-bar-height); z-index: 20; display: flex; flex-direction: column; background: #111b27; border-top: 1px solid var(--border); transition: height 180ms ease, border-color 180ms ease; }
   body.has-queue .queue-panel { height: auto; min-height: var(--queue-min-height); max-height: var(--queue-max-height); border-top-color: var(--amber); box-shadow: 0 -8px 28px rgba(0, 0, 0, 0.35); }
   .queue-inner { width: 100%; max-width: 960px; flex: 1; min-height: 0; margin: 0 auto; padding: 10px 16px; display: flex; flex-direction: column; justify-content: center; }
@@ -1731,9 +1707,6 @@ UI_HTML = """<!doctype html>
   .copy-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 2px 0 8px; }
   .copy-meta { margin-left: auto; }
   .copy-btn { font-size: 11.5px; padding: 3px 8px; }
-  .test-panel { display: flex; flex-direction: column; gap: 10px; max-width: 900px; }
-  .test-label { font-size: 12.5px; color: var(--muted); font-family: ui-monospace, monospace; }
-  .test-panel textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace; font-size: 13px; padding: 8px 10px; background: rgba(110, 118, 129, 0.08); color: inherit; border: 1px solid var(--border); border-radius: 6px; resize: vertical; }
   .test-result { padding: 10px 12px; border-radius: 6px; border: 1px solid var(--border); display: flex; flex-direction: column; gap: 6px; }
   .test-result.approved { border-color: rgba(63, 185, 80, 0.6); background: rgba(63, 185, 80, 0.08); }
   .test-result.denied { border-color: rgba(248, 81, 73, 0.6); background: rgba(248, 81, 73, 0.08); }
@@ -1798,14 +1771,10 @@ document.getElementById('queue-content').addEventListener('input', event => {
   }
 });
 
-// `test` has no tab button; it is reachable only via /test.
 // History is the default tab (at /); /history stays as an alias for old links.
-const TAB_PATHS = { live: '/rules', history: '/', usage: '/ai-usage', test: '/test' };
+const TAB_PATHS = { live: '/rules', history: '/', usage: '/ai-usage' };
 
-let testResult = null;
-let testRunning = false;
-
-// Shared verdict box for /test and the queue's Review button.
+// Verdict box for the queue's Review button.
 function renderVerdict(decision, reason, stage, extra = '', explanation = '', headExtra = '') {
   const ok = decision === 'approved';
   return `
@@ -1816,51 +1785,6 @@ function renderVerdict(decision, reason, stage, extra = '', explanation = '', he
       ${reason ? `<div>${esc(reason)}</div>` : ''}
       ${extra}
     </div>`;
-}
-
-function renderTestResult() {
-  if (testRunning) return '<div class="review-box">⏳ Checking...</div>';
-  if (!testResult) return '';
-  if (testResult.error) return `<div class="test-result denied"><strong>Error</strong> ${esc(testResult.error)}</div>`;
-  return renderVerdict(testResult.decision, testResult.deny_reason ?? (testResult.explanation ? '' : testResult.reason), testResult.stage,
-    `<details class="full-cmd-box"><summary>Command</summary><pre>${esc(testResult.command || '')}</pre></details>`, testResult.explanation);
-}
-
-function renderTest() {
-  // Keep the textarea (and its caret) across the periodic re-renders.
-  const existing = document.getElementById('test-panel');
-  if (existing) {
-    document.getElementById('test-result').innerHTML = renderTestResult();
-    document.getElementById('test-run').disabled = testRunning;
-    return;
-  }
-  document.getElementById('app').innerHTML = `
-    <section id="test-panel" class="test-panel">
-      <h2 class="panel-title"><span>Test request</span><button class="ghost" onclick="restartServer(this)">Restart aap-ui</button></h2>
-      <label class="test-label" for="test-script">python3 -c "…"</label>
-      <textarea id="test-script" rows="10" spellcheck="false" placeholder="print('hello')"></textarea>
-      <div><button id="test-run" class="approve" onclick="runTest()">Request</button></div>
-      <div id="test-result">${renderTestResult()}</div>
-    </section>`;
-}
-
-async function runTest() {
-  const script = document.getElementById('test-script').value;
-  testRunning = true;
-  testResult = null;
-  renderTest();
-  try {
-    const res = await fetch('/api/ui/test', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ script }),
-    });
-    testResult = await res.json();
-  } catch (e) {
-    testResult = { error: String(e) };
-  }
-  testRunning = false;
-  if (activeTab === 'test') renderTest();
 }
 
 function tabFromPath() {
@@ -2255,38 +2179,6 @@ async function saveEditRule(id, kind) {
   await fetchState();
 }
 
-async function restartServer(btn) {
-  const label = btn ? btn.textContent : '';
-  const show = (text, busy) => { if (btn) { btn.textContent = text; btn.disabled = busy; } };
-  const fail = (text) => {
-    show(text, false);
-    setTimeout(() => show(label, false), 3000);
-  };
-  show('Restarting…', true);
-  try {
-    const response = await fetch('/api/ui/restart', { method: 'POST' });
-    if (!response.ok) return fail('Restart failed (' + response.status + ')');
-  } catch (e) {
-    return fail('Restart failed');
-  }
-  // The server re-execs itself shortly after answering; wait until it is back.
-  const started = Date.now();
-  await new Promise(r => setTimeout(r, 500));
-  while (Date.now() - started < 20000) {
-    try {
-      const res = await fetch('/api/ui/state', { cache: 'no-store' });
-      if (res.ok) {
-        show('Back up, reloading…', true);
-        location.reload();
-        return;
-      }
-    } catch (e) { /* still down */ }
-    show('Restarting… ' + Math.round((Date.now() - started) / 1000) + 's', true);
-    await new Promise(r => setTimeout(r, 300));
-  }
-  fail('Server did not come back');
-}
-
 // Expanded full-command boxes stay open across periodic re-renders.
 const openScripts = new Set();
 
@@ -2511,7 +2403,6 @@ for (const ev of ['mousemove', 'mousedown', 'wheel', 'keydown', 'touchstart']) {
 document.addEventListener('keydown', e => {
   if (e.code !== 'KeyA' || !e.shiftKey || e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
   if (e.target.closest && e.target.closest('input, textarea, select, [contenteditable]')) return;
-  if (document.body.classList.contains('queue-hidden')) return;
   const accept = document.querySelector('#queue-content button.approve');
   if (!accept) return;
   e.preventDefault();
@@ -2545,7 +2436,7 @@ function renderAutoDecide(action) {
 // autoDecideTick() starts it once the operator has been idle long enough.
 function syncAutoCurrent(card) {
   const a = card && card.auto;
-  if (!a || activeTab === 'test' || autoCancelled.has(a.key) || autoFired.has(a.key)) {
+  if (!a || autoCancelled.has(a.key) || autoFired.has(a.key)) {
     autoCurrent = null;
     return;
   }
@@ -2892,7 +2783,6 @@ function render() {
   const queueContent = document.getElementById('queue-content');
   queueContent.hidden = pendingCount === 0;
   document.body.classList.toggle('has-queue', pendingCount > 0);
-  document.body.classList.toggle('queue-hidden', activeTab === 'test');
   document.getElementById('queue-label').textContent = pendingCount ? 'Approval Request' : 'Nothing to review';
   const cards = renderQueue();
   const idx = currentQueueIndex(cards);
@@ -2952,9 +2842,7 @@ function render() {
   }
 
   const app = document.getElementById('app');
-  if (activeTab === 'test') {
-    renderTest();
-  } else if (activeTab === 'live') {
+  if (activeTab === 'live') {
     if (!editingRuleId || !document.getElementById('edit-val-' + editingRuleId)) {
       app.innerHTML = '<div class="layout">' + renderRules() + '</div>';
     }
@@ -3074,7 +2962,7 @@ def make_handler(
             path = parsed.path
             qs = urllib.parse.parse_qs(parsed.query)
 
-            if path in ("/", "/rules", "/history", "/ai-usage", "/test"):
+            if path in ("/", "/rules", "/history", "/ai-usage"):
                 body = UI_HTML.encode("utf-8")
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -3212,19 +3100,6 @@ def make_handler(
                     self._send_json(HTTPStatus.OK, record)
                 return
 
-            if path == "/api/ui/test":
-                try:
-                    payload = self._read_json()
-                except (ValueError, json.JSONDecodeError) as exc:
-                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                    return
-                script = payload.get("script")
-                if not isinstance(script, str) or not script.strip():
-                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "missing_script"})
-                    return
-                self._send_json(HTTPStatus.OK, hub.test_python_script(script))
-                return
-
             if path == "/api/ui/rules":
                 try:
                     payload = self._read_json()
@@ -3234,7 +3109,7 @@ def make_handler(
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
 
-            if path == "/api/ui/restart":
+            if path == "/api/restart":
                 if on_restart is None:
                     self._send_json(HTTPStatus.NOT_IMPLEMENTED, {"error": "restart_unsupported"})
                     return
