@@ -2206,8 +2206,8 @@ function renderPythonScript(script) {
 }
 
 // Body of a card: the script for Python, otherwise the formatted call.
-// `meta` (queue cards: working directory and time) goes right-aligned on the
-// copy-button line.
+// `meta` (queue cards: working directory; history: wait and time) goes
+// right-aligned on the copy-button line.
 function renderCallBody(req, target, key, meta = '') {
   const command = target === req ? formatArgs(req) : target.command;
   // Long commands are clipped like Python scripts; the copy buttons hold the full text.
@@ -2899,9 +2899,9 @@ function render() {
         <div class="card">
           <div class="card-head">
             <div><span class="pill ${esc(rt)}">${esc(rt)}</span> ${toolLabel(req)} <span class="status-${esc(req.status)}">${esc(req.status)}</span>${renderDecisionLabels(req)}</div>
-            <div class="meta">${ruleLinks}<span>${esc(reason)}</span>${fmtWaited(req)}<span>${esc(req.created_at)}</span></div>
+            <div class="meta">${ruleLinks}<span>${esc(reason)}</span></div>
           </div>
-          ${renderCallBody(req, req, 'h-' + req.id)}
+          ${renderCallBody(req, req, 'h-' + req.id, `${fmtWaited(req)}<span>${esc(req.created_at)}</span>`)}
         </div>`;
     }).join('');
   }
