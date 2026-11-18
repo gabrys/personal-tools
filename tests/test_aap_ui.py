@@ -465,7 +465,7 @@ class AAPUITest(unittest.TestCase):
     def test_path_and_url_token_splitting_and_matching(self) -> None:
         toks, prefs = aap_ui.command_tokens_and_prefixes("rm /tmp/foo")
         self.assertEqual(toks, ["rm", "/tmp", "/foo"])
-        self.assertEqual(prefs, ["rm *", "rm /tmp/*", "rm /tmp/foo/*"])
+        self.assertEqual(prefs, ["rm *", "rm /tmp/* *", "rm /tmp/foo/* *"])
 
         toks2, prefs2 = aap_ui.command_tokens_and_prefixes(
             "curl http://foo.bar/api/v2/get_stuff"
@@ -477,13 +477,20 @@ class AAPUITest(unittest.TestCase):
             prefs2,
             [
                 "curl *",
-                "curl http:/*",
-                "curl http://foo.bar/*",
-                "curl http://foo.bar/api/*",
-                "curl http://foo.bar/api/v2/*",
-                "curl http://foo.bar/api/v2/get_stuff/*",
+                "curl http:/* *",
+                "curl http://foo.bar/* *",
+                "curl http://foo.bar/api/* *",
+                "curl http://foo.bar/api/v2/* *",
+                "curl http://foo.bar/api/v2/get_stuff/* *",
             ],
         )
+
+        command = "curl http://localhost:8000/user/ -s -b /tmp/panda.jar -o /tmp/home.html"
+        tokens, prefixes = aap_ui.command_tokens_and_prefixes(command)
+        selected = prefixes[tokens.index("/localhost:8000")]
+        self.assertEqual(selected, "curl http://localhost:8000/* *")
+        self.assertTrue(aap_ui._command_matches_prefix(command, selected))
+        self.assertFalse(aap_ui._command_matches_prefix("curl http://localhost:8001/user/ -s", selected))
 
         # Wildcard matching within arguments and trailing *
         self.assertTrue(aap_ui._command_matches_prefix("rm /tmp/foo/bar", "rm /tmp/*"))

@@ -304,7 +304,7 @@ def _with_trailing_wildcard(prefix: str) -> str:
     except ValueError:
         last = p.split()[-1] if p.split() else ""
     if _is_path_or_url_prefix(last):
-        return p + "*" if p.endswith("/") else p + "/*"
+        return (p + "*" if p.endswith("/") else p + "/*") + " *"
     return p + " *"
 
 
