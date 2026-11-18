@@ -328,6 +328,16 @@ class AAPUITest(unittest.TestCase):
             ],
         )
 
+    def test_extract_python_c_script_forms(self) -> None:
+        ex = aap_ui.extract_python_c_script
+        self.assertEqual(ex("python3 -c 'print(1)'"), "print(1)")
+        self.assertEqual(ex("python3 -I -c 'print(1)'"), "print(1)")
+        self.assertEqual(ex("python3 -Ic 'print(1)'"), "print(1)")
+        self.assertEqual(ex("/usr/bin/python3.12 -Ic 'print(1)'"), "print(1)")
+        for cmd in ("python3 -c", "python3 -I 'print(1)'", "python3 -I -I -c 'x'", "python3 -cI 'x'",
+                    "python3 -u -c 'x'", "python3 script.py", "node -c 'x'"):
+            self.assertIsNone(ex(cmd), cmd)
+
     def test_tab_urls_serve_the_ui(self) -> None:
         for path in ("/", "/rules", "/history", "/ai-usage"):
             with urllib.request.urlopen(f"{self.base_url}{path}", timeout=5.0) as resp:

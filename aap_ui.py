@@ -239,7 +239,8 @@ def split_compound_command(command: str) -> list[str]:
 
 
 def extract_python_c_script(command: str) -> str | None:
-    """Return the inline script if command is `python[3] -c '<script>'`."""
+    """Return the inline script if command is `python[3] -c '<script>'`,
+    optionally isolated: `python3 -I -c '<script>'` or `python3 -Ic '<script>'`."""
     text = command.strip()
     if not text:
         return None
@@ -251,14 +252,16 @@ def extract_python_c_script(command: str) -> str | None:
         tokens = part.words[part.assignments:]
     except ValueError:
         return None
-    if len(tokens) < 3:
+    if not tokens or not re.match(r"^python3?(?:\.\d+)*$", Path(tokens[0]).name):
         return None
-    exe = Path(tokens[0]).name
-    if not re.match(r"^python3?(?:\.\d+)*$", exe):
+    rest = tokens[1:]
+    if rest[:1] == ["-I"]:
+        rest = rest[1:]
+    elif rest[:1] == ["-Ic"]:
+        rest = ["-c", *rest[1:]]
+    if len(rest) < 2 or rest[0] != "-c":
         return None
-    if tokens[1] != "-c":
-        return None
-    return tokens[2]
+    return rest[1]
 
 
 def is_reviewable_python_script(script: str | None) -> bool:
