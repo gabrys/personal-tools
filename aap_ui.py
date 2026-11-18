@@ -41,6 +41,11 @@ UNSUPPORTED_SHELL_REASON = (
     "python3 -c '…' command, or run several commands separately if that makes "
     "sense for the task."
 )
+PYTHON_C_EXTRAS_REASON = (
+    "Inline Python must run as python3 -c '…' (or python3 -I -c '…') with no "
+    "environment variables before it and no arguments after the script; put "
+    "those values inside the script."
+)
 FILE_REDIRECTION_REASON = (
     "File redirections are not supported. Perform file operations separately "
     "using tools whose file access is checked against path-based rules."
@@ -62,6 +67,21 @@ class ShellCommand:
 
 class UnsupportedShell(ValueError):
     pass
+
+
+def _python_c_parts(words: list[str]) -> tuple[str, list[str]] | None:
+    """(script, arguments after it) when words are `python[3] [-I] -c SCRIPT ...`
+    or `python[3] -Ic SCRIPT ...`; None for anything else."""
+    if not words or not re.match(r"^python3?(?:\.\d+)*$", Path(words[0]).name):
+        return None
+    rest = words[1:]
+    if rest[:1] == ["-I"]:
+        rest = rest[1:]
+    elif rest[:1] == ["-Ic"]:
+        rest = ["-c", *rest[1:]]
+    if len(rest) < 2 or rest[0] != "-c":
+        return None
+    return rest[1], rest[2:]
 
 
 def parse_shell_command(command: str) -> list[ShellCommand]:
@@ -138,6 +158,16 @@ def parse_shell_command(command: str) -> list[ShellCommand]:
         nonlocal words, word_spans, assignments, has_redirect
         if len(words) <= assignments:
             raise UnsupportedShell(UNSUPPORTED_SHELL_REASON)
+        # Review and the Python card only see the script, so nothing else may
+        # steer it: no env assignments before python3 (also through `timeout`)
+        # and no arguments after the script.
+        starts = [assignments]
+        if words[assignments] == "timeout":
+            starts += [k for k in range(assignments + 1, len(words)) if words[k][:1].isalpha()][:1]
+        for k in starts:
+            parts = _python_c_parts(words[k:])
+            if parts is not None and (assignments or parts[1]):
+                raise UnsupportedShell(PYTHON_C_EXTRAS_REASON)
         if len(words) > assignments and words[assignments] == "timeout":
             split_idx = next(
                 (k for k in range(assignments + 1, len(words))
@@ -255,16 +285,8 @@ def extract_python_c_script(command: str) -> str | None:
         tokens = part.words[part.assignments:]
     except ValueError:
         return None
-    if not tokens or not re.match(r"^python3?(?:\.\d+)*$", Path(tokens[0]).name):
-        return None
-    rest = tokens[1:]
-    if rest[:1] == ["-I"]:
-        rest = rest[1:]
-    elif rest[:1] == ["-Ic"]:
-        rest = ["-c", *rest[1:]]
-    if len(rest) < 2 or rest[0] != "-c":
-        return None
-    return rest[1]
+    parsed = _python_c_parts(tokens)
+    return None if parsed is None else parsed[0]
 
 
 def is_reviewable_python_script(script: str | None) -> bool:

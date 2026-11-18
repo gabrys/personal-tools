@@ -95,16 +95,28 @@ class CommandEnvironmentTests(unittest.TestCase):
                     with self.subTest(prefix=prefix):
                         self.assertEqual(shlex.split(prefix)[:3], required_words)
 
-    def test_inline_python_is_detected_after_environment_assignments(self):
-        script = 'import os; print(os.environ["FOO"])'
-        for assignments in ("FOO=bar", "FOO='two words' CI=1", "FOO="):
-            with self.subTest(assignments=assignments):
-                self.assertEqual(
-                    aap_ui.extract_python_c_script(
-                        f"{assignments} python3 -c {shlex.quote(script)}"
-                    ),
-                    script,
-                )
+    def test_inline_python_with_environment_assignments_or_arguments_is_rejected(self):
+        # Review and the Python card see only the script, so nothing else may steer it.
+        script = shlex.quote('import os; print(os.environ["FOO"])')
+        for command in (
+            f"FOO=bar python3 -c {script}",
+            f"FOO='two words' CI=1 python3 -I -c {script}",
+            f"FOO= python3 -Ic {script}",
+            f"python3 -c {script} /etc/passwd",
+            f"python3 -Ic {script} --",
+            f"FOO=1 timeout 5 python3 -c {script}",
+            f"timeout 5 python3 -c {script} arg",
+            f"ls && LD_PRELOAD=/tmp/x.so python3 -c {script}",
+        ):
+            with self.subTest(command=command):
+                with self.assertRaises(aap_ui.UnsupportedShell) as ctx:
+                    aap_ui.parse_shell_command(command)
+                self.assertEqual(str(ctx.exception), aap_ui.PYTHON_C_EXTRAS_REASON)
+                self.assertIsNone(aap_ui.extract_python_c_script(command))
+        for command in (f"python3 -c {script}", f"timeout 5 python3 -I -c {script}",
+                        "FOO=bar python3 script.py arg", "python3 -m pytest -q"):
+            with self.subTest(command=command):
+                aap_ui.parse_shell_command(command)
 
     def test_assignment_arguments_are_not_treated_as_environment_prefixes(self):
         self.assertIsNone(

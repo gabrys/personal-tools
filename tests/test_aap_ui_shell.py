@@ -113,8 +113,8 @@ class ShellPolicyTests(unittest.TestCase):
             self.hub.rules.add_rule(aap_ui.Rule(
                 id=kind, kind=kind, tool="Bash", action="allow", prefix=prefix
             ))
-        for command in ("python3 -c " + shlex.quote("print(1)\n# line 2\n# line 3\n# line 4"),
-                        "FOO=bar python3 -c " + shlex.quote("print(1)\n# line 2\n# line 3\n# line 4")):
+        script = shlex.quote("print(1)\n# line 2\n# line 3\n# line 4")
+        for command in ("python3 -c " + script, "python3 -I -c " + script, "python3 -Ic " + script):
             with self.subTest(command=command):
                 record = self.request(command)
                 self.assertEqual(record["status"], "pending")
@@ -125,6 +125,12 @@ class ShellPolicyTests(unittest.TestCase):
                 self.assertEqual(decided["status"], "approved")
                 self.assertEqual(len(self.hub.rules.list_rules()), before)
                 self.assertEqual(self.request(command)["status"], "pending")
+        # Env assignments or trailing arguments are denied outright, even under allow rules.
+        for command in ("FOO=bar python3 -c " + script, "python3 -c " + script + " arg"):
+            with self.subTest(command=command):
+                record = self.request(command)
+                self.assertEqual(record["status"], "denied")
+                self.assertEqual(record["decision"]["reason"], aap_ui.PYTHON_C_EXTRAS_REASON)
 
 
 if __name__ == "__main__":
