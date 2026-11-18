@@ -132,6 +132,30 @@ class ShellPolicyTests(unittest.TestCase):
                 self.assertEqual(record["status"], "denied")
                 self.assertEqual(record["decision"]["reason"], aap_ui.PYTHON_C_EXTRAS_REASON)
 
+    def test_non_shell_tool_command_argument_is_not_parsed_as_shell(self):
+        # Codex sends apply_patch with the patch text under `command`.
+        patch_text = (
+            "*** Begin Patch\n*** Update File: /tmp/x/Main.java\n@@\n"
+            "-import android.view.Gravity;\n+    private WebView loadingView; // $HOME `x` (y) *z\n"
+            "*** End Patch\n"
+        )
+        record, _ = self.hub.create_request(
+            {"tool": "apply_patch", "arguments": {"command": patch_text}}, "patch-1",
+        )
+        self.assertEqual(record["status"], "pending")
+        self.assertIsNone(record["decision"])
+        self.assertEqual(record["subcommands"], [])
+        self.assertEqual(record["suggested_prefixes"], [])
+        self.assertIsNone(record["python_script"])
+
+        self.hub.rules.add_rule(aap_ui.Rule(
+            id="allow-patch", kind="tool", tool="apply_patch", action="allow"
+        ))
+        record, _ = self.hub.create_request(
+            {"tool": "apply_patch", "arguments": {"command": patch_text}}, "patch-2",
+        )
+        self.assertEqual(record["status"], "approved")
+
 
 if __name__ == "__main__":
     unittest.main()

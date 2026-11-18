@@ -1031,8 +1031,11 @@ class ApprovalHub:
 
             req_id = str(uuid.uuid4())
             now = utc_now_iso()
-            cmd_str = str(arguments.get("command") or arguments.get("CommandLine") or "")
-            has_cmd = "command" in arguments or "CommandLine" in arguments
+            # Only shell tools carry shell commands; other tools may use a
+            # `command` key for something else (Codex apply_patch puts the
+            # patch text there), which must not go through the shell parser.
+            has_cmd = tool in SHELL_TOOLS and ("command" in arguments or "CommandLine" in arguments)
+            cmd_str = str(arguments.get("command") or arguments.get("CommandLine") or "") if has_cmd else ""
             shell_parts: list[ShellCommand] = []
             shell_error = ""
             if has_cmd:
