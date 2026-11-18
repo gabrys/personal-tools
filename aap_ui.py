@@ -3083,6 +3083,10 @@ def make_handler(
                 self.wfile.write(body)
                 return
 
+            if path == "/api/status":
+                self._send_json(HTTPStatus.OK, {"status": "OK"})
+                return
+
             if path == "/api/ui/state":
                 self._send_json(HTTPStatus.OK, hub.ui_state())
                 return

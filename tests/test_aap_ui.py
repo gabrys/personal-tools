@@ -308,6 +308,11 @@ class AAPUITest(unittest.TestCase):
         self.assertEqual(snap["error"], "boom")
         self.assertIsNone(snap["data"])
 
+    def test_status_endpoint(self) -> None:
+        status, body = self._req("GET", "/api/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"status": "OK"})
+
     def test_tab_urls_serve_the_ui(self) -> None:
         for path in ("/", "/rules", "/history", "/ai-usage"):
             with urllib.request.urlopen(f"{self.base_url}{path}", timeout=5.0) as resp:
