@@ -45,7 +45,15 @@ FIVE_HOURS = dt.timedelta(hours=5)
 SIX_HOURS = dt.timedelta(hours=6)
 FIVE_HOUR_SHIFT = dt.timedelta(minutes=15)
 ONE_WEEK = dt.timedelta(days=7)
+EIGHT_DAYS = dt.timedelta(days=8)
+ONE_WEEK_SHIFT = dt.timedelta(hours=6)
 STALE_MAX_AGE = dt.timedelta(minutes=12)
+
+# Temporary pacing overrides: virtual duration and shift past reset.
+WINDOW_OVERRIDES = {
+    FIVE_HOURS: (SIX_HOURS, FIVE_HOUR_SHIFT),
+    ONE_WEEK: (EIGHT_DAYS, ONE_WEEK_SHIFT),
+}
 
 ANSI = {
     "reset": "\033[0m",
@@ -71,7 +79,7 @@ class UsageWindow:
     reset_text: Optional[str] = None
     duration: Optional[dt.timedelta] = None
 
-    def expected(self, now):
+    def expected(self, now, deadline=None):
         """
         Percentage of the window that has elapsed.
 
@@ -81,14 +89,22 @@ class UsageWindow:
         if self.reset is None or not self.duration:
             return None
 
-        # Temporary: treat 5h windows as 6h windows shifted
-        # 15 minutes later (100% expected 15m after reset).
-        if self.duration == FIVE_HOURS:
-            duration = SIX_HOURS
-            end = self.reset + FIVE_HOUR_SHIFT
-        else:
-            duration = self.duration
-            end = self.reset
+        # Temporary: extend 5h -> 6h (+15m past reset) and
+        # 7d -> 8d (+6h past reset) for progress pacing.
+        duration, shift = WINDOW_OVERRIDES.get(
+            self.duration, (self.duration, dt.timedelta(0))
+        )
+        end = self.reset + shift
+        if (
+            self.duration == FIVE_HOURS
+            and deadline is not None
+            and deadline < self.reset
+        ):
+            start = end - duration
+            end = deadline
+            duration = end - start
+            if duration <= dt.timedelta(0):
+                return 100.0
 
         remaining = (
             end - now
@@ -103,6 +119,20 @@ class UsageWindow:
 class UsageGroup:
     name: str
     windows: list = field(default_factory=list)
+
+    def pacing_reset(self, item, now):
+        if item.duration != FIVE_HOURS or item.reset is None:
+            return item.reset
+        deadline = min(
+            (window.reset for window in self.windows
+             if window.duration == ONE_WEEK and window.reset is not None
+             and window.reset > now),
+            default=None,
+        )
+        return min(item.reset, deadline) if deadline is not None else item.reset
+
+    def expected(self, item, now):
+        return item.expected(now, deadline=self.pacing_reset(item, now))
 
 
 @dataclass
@@ -1230,7 +1260,7 @@ def agent_scores(results, now=None):
                     continue
 
                 for item in group.windows:
-                    expected = item.expected(now)
+                    expected = group.expected(item, now)
 
                     if item.used is None or expected is None:
                         continue
@@ -1400,15 +1430,16 @@ def usage_data(only=None, now=None, results=None):
 
         return int(max(0.0, min(100.0, float(value))) + 0.5)
 
-    def window(item):
-        expected = item.expected(now)
+    def window(item, group):
+        expected = group.expected(item, now)
+        reset = group.pacing_reset(item, now)
 
         return {
             "label": item.label,
             "expected_percent": percent(expected),
             "used_percent": percent(item.used),
-            "reset": iso(item.reset),
-            "reset_text": item.reset_text,
+            "reset": iso(reset),
+            "reset_text": item.reset_text if reset == item.reset else None,
         }
 
     return {
@@ -1420,7 +1451,7 @@ def usage_data(only=None, now=None, results=None):
                     {
                         "name": group.name,
                         "windows": [
-                            window(item)
+                            window(item, group)
                             for item in group.windows
                         ],
                     }

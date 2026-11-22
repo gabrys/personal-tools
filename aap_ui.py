@@ -176,9 +176,13 @@ def parse_shell_command(command: str) -> list[ShellCommand]:
                 None,
             )
             if split_idx is not None:
+                timeout_pos = word_spans[assignments][0]
                 split_pos = word_spans[split_idx][0]
-                result.append(ShellCommand(command[start:split_pos].strip(), words[:split_idx], assignments, ""))
-                result.append(ShellCommand(command[split_pos:end].strip(), words[split_idx:], 0, operator))
+                env_text = command[start:timeout_pos].strip() if assignments else ""
+                cmd_tail = command[split_pos:end].strip()
+                cmd_text = f"{env_text} {cmd_tail}" if env_text else cmd_tail
+                result.append(ShellCommand(command[timeout_pos:split_pos].strip(), words[assignments:split_idx], 0, ""))
+                result.append(ShellCommand(cmd_text, [*words[:assignments], *words[split_idx:]], assignments, operator))
                 words = []
                 word_spans = []
                 assignments = 0
@@ -437,31 +441,58 @@ def _command_matches_prefix(command: str, prefix: str) -> bool:
     return all(_match_token_wildcard(p, c) for p, c in zip(pref_tokens, cmd_tokens))
 
 
-READ_PATH_TOOLS = {
-    "read_file",
-    "Read",
-    "view_file",
-    "list_dir",
-    "find_by_name",
-    "grep_search",
-    "Glob",
-    "Grep",
+# Canonical tool names across runtimes (Claude Code, Codex, Antigravity).
+TOOL_ALIASES: dict[str, str] = {
+    # Shell execution
+    "Bash": "run",
+    "run_command": "run",
+    # File read (ro)
+    "Read": "read",
+    "read_file": "read",
+    "view_file": "read",
+    "view_image": "read",
+    # File search / list (ro)
+    "Glob": "glob",
+    "find_by_name": "glob",
+    "Grep": "grep",
+    "grep_search": "grep",
+    # File edit / write (rw)
+    "Edit": "edit",
+    "MultiEdit": "edit",
+    "edit_file": "edit",
+    "replace_file_content": "edit",
+    "multi_replace_file_content": "edit",
+    "Write": "write",
+    "write_file": "write",
+    "write_to_file": "write",
+    # User questions
+    "AskUserQuestion": "ask",
+    "ask_question": "ask",
+    "request_user_input": "ask",
+    "request_user_input_async": "ask",
+    # Web
+    "WebFetch": "web_fetch",
+    "read_url_content": "web_fetch",
+    "search_web": "web_search",
+    "WebSearch": "web_search",
+    # Background tasks & subagents
+    "TaskStop": "manage_task",
+    "TaskOutput": "manage_task",
+    "Agent": "subagent",
+    "invoke_subagent": "subagent",
 }
-WRITE_PATH_TOOLS = {
-    "edit_file",
-    "write_file",
-    "write_to_file",
-    "replace_file_content",
-    "multi_replace_file_content",
-    "Edit",
-    "Write",
-    "MultiEdit",
-    "NotebookEdit",
-    "apply_patch",
-}
+
+
+def canonical_tool(tool: str) -> str:
+    return TOOL_ALIASES.get(tool, tool)
+
+
+READ_PATH_TOOLS = {"read", "glob", "grep", "list_dir"}
+WRITE_PATH_TOOLS = {"edit", "write", "NotebookEdit", "apply_patch"}
 
 
 def _path_tool_level(tool: str) -> str | None:
+    tool = canonical_tool(tool)
     if tool in READ_PATH_TOOLS:
         return "ro"
     if tool in WRITE_PATH_TOOLS:
@@ -469,8 +500,11 @@ def _path_tool_level(tool: str) -> str | None:
     return None
 
 
+PATH_ARG_KEYS = ("Path", "file_path", "path", "TargetFile", "DirectoryPath", "SearchPath")
+
+
 def _extract_path_arg(arguments: dict[str, Any]) -> str | None:
-    for key in ("Path", "file_path", "path", "TargetFile", "DirectoryPath", "SearchPath"):
+    for key in PATH_ARG_KEYS:
         val = arguments.get(key)
         if isinstance(val, str) and val.strip():
             return val
@@ -483,7 +517,7 @@ _SITE_OPERATOR = re.compile(r"(?:^|\s)site:\s*(?:https?://)?([A-Za-z0-9-]+(?:\.[
 WEBRUN_PAGE_OPS = ("open", "find", "click", "screenshot")
 WEBRUN_QUERY_OPS = ("search_query", "image_query")
 WEBRUN_OPTION_KEYS = {"response_length"}
-WEB_TOOLS = {"webrun", "search_web", "WebFetch"}
+WEB_TOOLS = {"webrun", "web_search", "web_fetch"}
 
 
 def _url_host(value: Any) -> str | None:
@@ -501,6 +535,7 @@ def extract_web_domains(tool: str, arguments: dict[str, Any]) -> tuple[list[str]
     somewhere unknown (an unrestricted search, a result reference instead of
     a URL, an unrecognised operation). Allow domain rules only cover calls
     with no unknown part; deny domain rules fire on any listed domain."""
+    tool = canonical_tool(tool)
     domains: list[str] = []
     unresolved = False
 
@@ -512,11 +547,19 @@ def extract_web_domains(tool: str, arguments: dict[str, Any]) -> tuple[list[str]
         else:
             unresolved = True
 
-    if tool == "search_web":
+    if tool == "web_search":
         dom = arguments.get("domain")
-        add(dom.strip().lower() if isinstance(dom, str) and dom.strip() else None)
-    elif tool == "WebFetch":
-        add(_url_host(arguments.get("url")))
+        if isinstance(dom, str) and dom.strip():
+            add(dom.strip().lower())
+        elif isinstance(arguments.get("allowed_domains"), list) and arguments["allowed_domains"]:
+            for d in arguments["allowed_domains"]:
+                add(d.strip().lower() if isinstance(d, str) and d.strip() else None)
+        else:
+            q = arguments.get("query")
+            sites = _SITE_OPERATOR.findall(q) if isinstance(q, str) else []
+            add(sites[0].rstrip(".").lower() if len(sites) == 1 else None)
+    elif tool == "web_fetch":
+        add(_url_host(arguments.get("url") or arguments.get("Url")))
     elif tool == "webrun":
         for key, items in arguments.items():
             if key in WEBRUN_OPTION_KEYS:
@@ -598,7 +641,7 @@ def _rule_path_level(rule: "Rule") -> str:
 
 
 # Tools that run a shell command line (Claude Code/Codex, Antigravity).
-SHELL_TOOLS = {"Bash", "run_command"}
+SHELL_TOOLS = {"run", "Bash", "run_command"}
 
 
 MOBILE_TEXT_CHARS = 80
@@ -622,8 +665,12 @@ def _mobile_text(req: dict[str, Any]) -> str:
     args = req.get("arguments") or {}
     text = args.get("command") or args.get("CommandLine")
     if not isinstance(text, str):
-        path = args.get("file_path") or args.get("path") or args.get("Path")
-        text = path if isinstance(path, str) else json.dumps(args, ensure_ascii=False)
+        path = _extract_path_arg(args)
+        if isinstance(path, str):
+            pat = args.get("pattern") or args.get("Query") or args.get("Pattern")
+            text = f"{path} [{pat}]" if isinstance(pat, str) and pat else path
+        else:
+            text = json.dumps(args, ensure_ascii=False)
     return _one_line(text)
 
 
@@ -652,7 +699,7 @@ def mobile_notifications(state: dict[str, Any], now: float | None = None) -> lis
 def _mobile_who(req: dict[str, Any]) -> str:
     if req.get("python_script") is not None:
         return "Python"
-    return "run" if req.get("tool") in SHELL_TOOLS else str(req.get("tool"))
+    return canonical_tool(str(req.get("tool") or ""))
 
 # Where a decision came from, stored as decision["labels"] (in this order):
 #   rule      - an existing permanent rule matched
@@ -692,6 +739,25 @@ def merge_labels(*groups: Any) -> list[str]:
     return [label for label in DECISION_LABELS if label in found]
 
 
+def _exact_match_key(tool: str, arguments: dict[str, Any] | None) -> Any:
+    args = arguments or {}
+    if canonical_tool(tool) == "run":
+        cmd = args.get("command")
+        if not isinstance(cmd, str):
+            cmd = args.get("CommandLine")
+        if isinstance(cmd, str):
+            return ("run", cmd)
+    return args
+
+
+RECENT_HITS_SECONDS = 3 * 86400
+
+
+def _prune_recent_hits(stamps: list[int] | None, now: float | None = None) -> list[int]:
+    cutoff = (time.time() if now is None else now) - RECENT_HITS_SECONDS
+    return [int(ts) for ts in (stamps or ()) if isinstance(ts, (int, float)) and ts >= cutoff]
+
+
 @dataclass
 class Rule:
     id: str
@@ -704,7 +770,13 @@ class Rule:
     created_at: str = field(default_factory=utc_now_iso)
     expires_at: str | None = None
     hits: int = 0
+    recent_hits: list[int] = field(default_factory=list)
     reason: str = ""  # deny rules: told to the agent instead of "Matched rule (...)"
+
+    def __post_init__(self) -> None:
+        if self.tool != "*":
+            self.tool = canonical_tool(self.tool)
+        self.recent_hits = _prune_recent_hits(self.recent_hits)
 
     def is_expired(self, now: datetime | None = None) -> bool:
         if not self.expires_at:
@@ -716,6 +788,7 @@ class Rule:
         return (now or datetime.now(timezone.utc)) >= exp
 
     def matches(self, tool: str, arguments: dict[str, Any]) -> bool:
+        tool = canonical_tool(tool)
         command = arguments.get("command") or arguments.get("CommandLine")
         if (self.action == "allow" and isinstance(command, str)
                 and extract_reviewable_python_script(command) is not None):
@@ -733,10 +806,8 @@ class Rule:
             path_val = _extract_path_arg(arguments)
             return isinstance(path_val, str) and _match_token_wildcard(self.prefix, path_val)
         if self.tool != "*" and self.tool != tool and not (
-            # A shell command is the same command whichever agent's shell
-            # tool runs it (Bash for Claude Code/Codex, run_command for
-            # Antigravity), so command rules apply across them.
-            self.kind == "command_prefix" and self.tool in SHELL_TOOLS and tool in SHELL_TOOLS
+            (self.kind == "command_prefix" and self.tool in SHELL_TOOLS and tool in SHELL_TOOLS)
+            or (self.kind == "domain" and self.tool in WEB_TOOLS and tool in WEB_TOOLS)
         ):
             return False
         if self.kind == "tool":
@@ -753,10 +824,11 @@ class Rule:
                 return bool(hits)
             return bool(domains) and not unresolved and len(hits) == len(domains)
         if self.kind == "exact":
-            return (self.arguments or {}) == (arguments or {})
+            return _exact_match_key(self.tool, self.arguments) == _exact_match_key(tool, arguments)
         return False
 
     def to_dict(self) -> dict[str, Any]:
+        recent = _prune_recent_hits(self.recent_hits)
         return {
             "id": self.id,
             "kind": self.kind,
@@ -768,6 +840,8 @@ class Rule:
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "hits": self.hits,
+            "hits_3d": len(recent),
+            "recent_hits": recent,
             "reason": self.reason,
         }
 
@@ -784,6 +858,7 @@ class Rule:
             created_at=str(data.get("created_at") or utc_now_iso()),
             expires_at=data.get("expires_at"),
             hits=int(data.get("hits") or 0),
+            recent_hits=_prune_recent_hits(data.get("recent_hits")),
             reason=str(data.get("reason") or ""),
         )
 
@@ -840,7 +915,9 @@ class RuleStore:
                     if best_key is None or key > best_key:
                         best, best_key = rule, key
             if best is not None and record_hit:
+                now_ts = int(time.time())
                 best.hits += 1
+                best.recent_hits = _prune_recent_hits([*best.recent_hits, now_ts], now=now_ts)
                 self._save()
             return best
 
@@ -865,6 +942,9 @@ class RuleStore:
             replaced = [r for r in self._rules if self._superseded_by(r, rule)]
             if replaced:
                 rule.hits += sum(r.hits for r in replaced)
+                rule.recent_hits = _prune_recent_hits(
+                    [*rule.recent_hits, *(ts for r in replaced for ts in r.recent_hits)]
+                )
                 self._rules = [r for r in self._rules if r not in replaced]
                 self._rules.insert(0, rule)
                 self._save()
@@ -872,10 +952,14 @@ class RuleStore:
             def same_target(r: Rule) -> bool:
                 return (
                     r.kind == rule.kind
-                    and r.tool == rule.tool
+                    and (
+                        r.tool == rule.tool
+                        or (r.kind == "domain" and r.tool in WEB_TOOLS and rule.tool in WEB_TOOLS)
+                        or (r.kind == "command_prefix" and r.tool in SHELL_TOOLS and rule.tool in SHELL_TOOLS)
+                    )
                     and r.prefix == rule.prefix
                     and _rule_path_level(r) == _rule_path_level(rule)
-                    and r.arguments == rule.arguments
+                    and _exact_match_key(r.tool, r.arguments) == _exact_match_key(rule.tool, rule.arguments)
                 )
 
             # The same rule with the opposite action is replaced.
@@ -885,8 +969,11 @@ class RuleStore:
                 if same_target(existing):
                     if rule.hits > 0:
                         existing.hits += rule.hits
+                    if rule.recent_hits:
+                        existing.recent_hits = _prune_recent_hits([*existing.recent_hits, *rule.recent_hits])
                     if rule.reason.strip():
                         existing.reason = rule.reason.strip()
+                    if rule.hits > 0 or rule.recent_hits or rule.reason.strip():
                         self._save()
                     return existing
             self._rules.insert(0, rule)
@@ -897,7 +984,9 @@ class RuleStore:
         with self._lock:
             for rule in self._rules:
                 if rule.id == rule_id:
+                    now_ts = int(time.time())
                     rule.hits += 1
+                    rule.recent_hits = _prune_recent_hits([*rule.recent_hits, now_ts], now=now_ts)
                     self._save()
                     return
 
@@ -1014,7 +1103,7 @@ def choose_review_agent(runtime: str, data: dict[str, Any] | None) -> tuple[str,
 class ApprovalHub:
     """In-memory AAP request queue with long-polling and SSE notifications."""
 
-    def __init__(self, rules: RuleStore, history_limit: int = 100) -> None:
+    def __init__(self, rules: RuleStore, history_limit: int = 500) -> None:
         self.rules = rules
         # `--agent <name>` is appended per review by choose_review_agent().
         self.review_cmd: list[str] = [
@@ -1130,7 +1219,8 @@ class ApprovalHub:
     ) -> tuple[dict[str, Any], int]:
         received_at = time.time()
         canonical = json.dumps(payload, sort_keys=True)
-        tool = str(payload.get("tool") or "")
+        raw_tool = str(payload.get("tool") or "")
+        tool = canonical_tool(raw_tool)
         arguments = payload.get("arguments")
         if not isinstance(arguments, dict):
             arguments = {}
@@ -1255,6 +1345,7 @@ class ApprovalHub:
             record: dict[str, Any] = {
                 "id": req_id,
                 "tool": tool,
+                "raw_tool": raw_tool,
                 "server": payload.get("server") or "",
                 "arguments": arguments,
                 "agent_reasoning": payload.get("agent_reasoning") or "",
@@ -1356,12 +1447,19 @@ class ApprovalHub:
         (allow only) this exact call for 12h."""
         tool = record["tool"]
         args = {"command": target_sub["command"]} if target_sub is not None else record["arguments"]
-        base = {"id": str(uuid.uuid4()), "tool": tool, "action": action, "hits": 1, "reason": reason}
+        base = {
+            "id": str(uuid.uuid4()),
+            "tool": tool,
+            "action": action,
+            "hits": 1,
+            "recent_hits": [int(time.time())],
+            "reason": reason,
+        }
         if allow_always == "tool":
             return Rule(kind="tool", **base)
         if allow_always == "domain":
             chosen = prefix.strip() or next(iter(record.get("domains") or []), "")
-            return Rule(kind="domain", prefix=chosen, **base) if chosen else None
+            return Rule(kind="domain", prefix=chosen, **{**base, "tool": "*"}) if chosen else None
         if allow_always == "prefix":
             chosen = prefix.strip() or (
                 record["suggested_prefixes"][0] if record["suggested_prefixes"] else ""
@@ -1643,7 +1741,7 @@ class ApprovalHub:
             ]
             return {
                 "pending": pending,
-                "history": history[:50],
+                "history": history[:500],
                 "rules": self.rules.list_rules(),
             }
 
@@ -1810,6 +1908,12 @@ UI_HTML = """<!doctype html>
   .queue-nav button:disabled { opacity: 0.35; cursor: default; }
   body.has-queue .queue-inner { padding: 14px 16px; justify-content: flex-start; }
   body:not(.has-queue) #queue-title { margin: 0; font-weight: 400; text-transform: none; letter-spacing: 0; }
+  #queue-title { flex-wrap: wrap; gap: 8px 12px; }
+  .queue-controls { display: inline-flex; align-items: center; gap: 12px; margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 400; }
+  .auto-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); cursor: pointer; user-select: none; white-space: nowrap; }
+  .auto-toggle:hover { color: var(--text); }
+  .auto-toggle input { margin: 0; accent-color: var(--green-h); cursor: pointer; }
+  .auto-toggle:has(input:checked) { color: var(--text); }
   @media (prefers-reduced-motion: reduce) {
     body, .queue-panel { transition: none; }
   }
@@ -1820,7 +1924,12 @@ UI_HTML = """<!doctype html>
     header { gap: 10px 14px; padding: 12px 16px; }
     .queue-content input.reason { min-width: 140px; }
   }
-  .panel-title { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 10px; display: flex; align-items: center; justify-content: space-between; }
+  .panel-title { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 10px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; }
+  .sort-pills { display: inline-flex; flex-wrap: wrap; max-width: 100%; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: #0d1117; text-transform: none; letter-spacing: 0; font-weight: 500; }
+  .sort-btn { background: transparent; border: 0; border-radius: 0; color: var(--muted); padding: 3px 8px; font-size: 11.5px; font-weight: 500; cursor: pointer; line-height: 1.3; }
+  .sort-btn + .sort-btn { border-left: 1px solid var(--border); }
+  .sort-btn:hover { color: var(--text); background: #161b22; }
+  .sort-btn.active { background: #21262d; color: var(--text); }
   .sub-title { font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 14px 0 8px; }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 12px; }
   .rule-card { background: #1c2128; border-color: #363d46; transition: border-color 0.1s, background 0.1s; }
@@ -1831,6 +1940,8 @@ UI_HTML = """<!doctype html>
   .ttl-row .pill { flex: none; }
   code.ttl-code { display: block; min-width: 0; max-height: calc(7 * 1.65em + 4px); overflow: hidden; }
   .rule-card .btn-group { float: right; margin: 0 0 -3px 12px; }
+  .rule-added { font-size: 11.5px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; margin-right: 2px; }
+  @media (max-width: 666px) { .rule-added { display: none; } }
   .rule-card .action-icon { margin-right: 6px; position: relative; top: 2px; }
   .rule-card:hover { border-color: #58a6ff; background: #232a35; }
   .card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
@@ -1859,7 +1970,10 @@ UI_HTML = """<!doctype html>
   .hits-pill { color: #79c0ff; border-color: rgba(88, 166, 255, 0.25); background: rgba(31, 111, 235, 0.08); font-variant-numeric: tabular-nums; }
   .hits-link { text-decoration: none; cursor: pointer; transition: background 0.1s, border-color 0.1s, color 0.1s; }
   .hits-link:hover { background: rgba(31, 111, 235, 0.24); border-color: #58a6ff; color: #fff; }
-  .filter-bar { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 14px; margin-bottom: 12px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; font-size: 13px; color: var(--muted); }
+  .filter-bar { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; margin-bottom: 12px; background: var(--card); border: 1px solid var(--border); border-radius: 8px; font-size: 12.5px; color: var(--muted); }
+  .filter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .filter-meta { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; font-variant-numeric: tabular-nums; }
+  .filter-clear { padding: 2px 8px; font-size: 11.5px; }
   .rule-jump-link { display: inline-flex; align-items: center; gap: 4px; font-family: ui-monospace, monospace; font-size: 11.5px; color: #79c0ff; background: rgba(31, 111, 235, 0.12); border: 1px solid rgba(88, 166, 255, 0.3); border-radius: 4px; padding: 1px 7px; text-decoration: none; cursor: pointer; transition: background 0.1s, border-color 0.1s, color 0.1s; }
   /* Exact-call rules can carry whole file contents: clip the link to 2 lines. */
   .rule-jump-link { display: inline-block; vertical-align: top; max-width: 100%; max-height: calc(2 * 1.45em + 4px); overflow: hidden; line-height: 1.45; overflow-wrap: anywhere; }
@@ -1889,9 +2003,11 @@ UI_HTML = """<!doctype html>
   .rule-reason-text { margin-top: 4px; font-size: 12px; color: var(--muted); }
   code.rule-code { font-family: ui-monospace, monospace; font-size: 13px; background: #0d1117; border: 1px solid var(--border); padding: 2px 7px; border-radius: 4px; color: var(--text); overflow-wrap: anywhere; word-break: break-word; }
   .chip-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
-  .rule-chip { display: inline-flex; align-items: center; gap: 10px; background: #1c2128; border: 1px solid #363d46; border-radius: 8px; padding: 8px 12px; font-size: 13px; transition: border-color 0.1s, background 0.1s; }
+  .rule-chip { flex: 1 1 auto; max-width: 100%; min-width: 0; display: flex; align-items: center; gap: 10px; background: #1c2128; border: 1px solid #363d46; border-radius: 8px; padding: 8px 12px; font-size: 13px; transition: border-color 0.1s, background 0.1s; }
   .rule-chip:hover { border-color: #58a6ff; background: #232a35; }
-  .rule-chip code { font-family: ui-monospace, monospace; font-size: 13px; color: var(--text); }
+  .rule-chip code { font-family: ui-monospace, monospace; font-size: 13px; color: var(--text); min-width: 0; }
+  .rule-chip .hits-pill { margin-left: auto; }
+  .rule-chip .action-icon, .rule-chip .hits-pill, .rule-chip .del-btn { flex: none; }
   button.review-btn { background: #6e40c9; }
   button.review-btn:hover { background: #8957e5; }
   button.review-btn:disabled { opacity: 0.65; cursor: wait; }
@@ -1932,11 +2048,12 @@ UI_HTML = """<!doctype html>
   .u-alert { font-size: 11.5px; text-transform: none; letter-spacing: 0; color: #ffa198; background: rgba(218, 54, 51, 0.16); border: 1px solid rgba(248, 81, 73, 0.35); border-radius: 999px; padding: 1px 8px; }
   .u-heading { margin-bottom: 16px; }
   /* Header usage strip: one meter per model group. */
-  /* Name + tabs on the left, usage strip on the right; the strip never
-     shrinks, so when it does not fit it wraps to a row of its own. */
+  /* Name + tabs on the left, usage strip on the right; the strip keeps all
+     meters together on the first row if they fit, otherwise starts on a new
+     row and lets individual meters wrap across lines. */
   .head-main { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 20px; }
   header h1, header .tabs { flex: none; white-space: nowrap; }
-  .hu { flex: none; max-width: 100%; display: flex; align-items: center; gap: 8px; overflow-x: auto; scrollbar-width: none; }
+  .hu { flex: none; max-width: 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
   .hu[hidden] { display: none; }
   .hu-meter { flex: none; position: relative; width: 116px; height: 26px; border-radius: 6px; background: #21262d; border: 1px solid var(--border); overflow: hidden; cursor: pointer; }
   .hu-meter:hover { border-color: #8b949e; }
@@ -1968,7 +2085,8 @@ UI_HTML = """<!doctype html>
   .copy-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 2px 0 8px; }
   .copy-meta { margin-left: auto; }
   .copy-btn { font-size: 11.5px; padding: 3px 8px; }
-  .test-result { padding: 10px 12px; border-radius: 6px; border: 1px solid var(--border); display: flex; flex-direction: column; gap: 6px; }
+  .test-result { min-width: 0; overflow: hidden; padding: 10px 12px; border-radius: 6px; border: 1px solid var(--border); display: flex; flex-direction: column; gap: 6px; }
+  .test-result > div { min-width: 0; overflow: hidden; }
   .test-result.approved { border-color: rgba(63, 185, 80, 0.6); background: rgba(63, 185, 80, 0.08); }
   .test-result.denied { border-color: rgba(248, 81, 73, 0.6); background: rgba(248, 81, 73, 0.08); }
   /* Decision-source labels in History. */
@@ -2004,10 +2122,16 @@ UI_HTML = """<!doctype html>
 <section id="queue-panel" class="queue-panel" aria-labelledby="queue-title">
   <div class="queue-inner">
     <h2 id="queue-title" class="panel-title"><span id="queue-label">Nothing to review</span>
-      <span id="queue-nav" class="queue-nav" hidden>
-        <button id="queue-prev" class="ghost" onclick="queueStep(-1)" title="Previous request" aria-label="Previous request">&lsaquo;</button>
-        <span id="queue-pos" aria-live="polite"></span>
-        <button id="queue-next" class="ghost" onclick="queueStep(1)" title="Next request" aria-label="Next request">&rsaquo;</button>
+      <span class="queue-controls">
+        <label class="auto-toggle" title="Auto-accept requests after 10s idle + 30s countdown (or apply AI review verdict)">
+          <input type="checkbox" id="auto-decide-toggle" />
+          <span>Auto-accept</span>
+        </label>
+        <span id="queue-nav" class="queue-nav" hidden>
+          <button id="queue-prev" class="ghost" onclick="queueStep(-1)" title="Previous request" aria-label="Previous request">&lsaquo;</button>
+          <span id="queue-pos" aria-live="polite"></span>
+          <button id="queue-next" class="ghost" onclick="queueStep(1)" title="Next request" aria-label="Next request">&rsaquo;</button>
+        </span>
       </span></h2>
     <div id="queue-content" class="queue-content" tabindex="0" aria-label="Requests awaiting approval" hidden></div>
   </div>
@@ -2248,9 +2372,15 @@ function fmtIn(iso) {
   return 'in ' + (d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`);
 }
 
+function fmtTime24(d, withSeconds = false) {
+  const p = n => String(n).padStart(2, '0');
+  const base = `${p(d.getHours())}:${p(d.getMinutes())}`;
+  return withSeconds ? `${base}:${p(d.getSeconds())}` : base;
+}
+
 function fmtWhen(iso) {
   const d = new Date(iso);
-  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const time = fmtTime24(d);
   return d.toDateString() === new Date().toDateString()
     ? time : d.toLocaleDateString([], { weekday: 'short' }) + ' ' + time;
 }
@@ -2327,7 +2457,7 @@ function renderUsage() {
   const u = usage || {};
   const status = [`refreshes every ${u.interval || 30}s`];
   if (u.loading) status.push('refreshing…');
-  else if (u.updated_at) status.push('updated ' + new Date(u.updated_at).toLocaleTimeString());
+  else if (u.updated_at) status.push('updated ' + fmtTime24(new Date(u.updated_at), true));
   let body;
   if (u.data) body = '<div class="u-grid">' + Object.entries(u.data.providers).map(([k, p]) => usageProvider(k, p)).join('') + '</div>';
   else if (u.error && !u.loading) body = `<div class="empty u-red">Unavailable: ${esc(u.error)}</div>`;
@@ -2348,13 +2478,66 @@ function setFavicon(pending) {
   document.getElementById('favicon').href = 'data:image/svg+xml,' + svg;
 }
 
+const HISTORY_FILTERS_STORAGE_KEY = 'aap-ui:history-filters';
+const HISTORY_STATUS_MODES = [
+  ['all', 'All', 'All statuses'],
+  ['approved', 'Approved', 'Approved requests'],
+  ['denied', 'Denied', 'Denied requests'],
+  ['other', 'Other', 'Expired or cancelled requests'],
+];
+const HISTORY_SOURCE_MODES = [
+  ['all', 'All', 'All decision sources'],
+  ['non-rule', 'Non-rule', 'Exclude automatic rule and 12h matches'],
+  ['lazy', 'Lazy', 'Auto-decided after 30s idle'],
+  ['click', 'Manual', 'Decided manually by clicking'],
+  ['ai-review', 'AI review', 'Python scripts with AI review'],
+  ['rule', 'Rule', 'Matched a permanent rule or 12h acceptance'],
+];
+
+function defaultHistoryFilters() {
+  return { status: 'all', source: 'all' };
+}
+
+function loadHistoryFilters() {
+  const filters = defaultHistoryFilters();
+  try {
+    const raw = JSON.parse(prefGet(HISTORY_FILTERS_STORAGE_KEY) || '{}');
+    if (raw && typeof raw === 'object') {
+      if (HISTORY_STATUS_MODES.some(([m]) => m === raw.status)) filters.status = raw.status;
+      if (HISTORY_SOURCE_MODES.some(([m]) => m === raw.source)) filters.source = raw.source;
+    }
+  } catch (e) {}
+  return filters;
+}
+
+let historyFilters = loadHistoryFilters();
+
+function saveHistoryFilters() {
+  prefSet(HISTORY_FILTERS_STORAGE_KEY, JSON.stringify(historyFilters));
+}
+
+function setHistoryFilter(key, value) {
+  historyFilters[key] = value;
+  saveHistoryFilters();
+  render();
+}
+
 function openRuleHistory(ruleId) {
+  historyFilters = defaultHistoryFilters();
+  saveHistoryFilters();
   historyRuleFilter = ruleId;
   setTab('history');
 }
 
+function clearHistoryRuleFilter() {
+  historyRuleFilter = null;
+  render();
+}
+
 function clearHistoryFilter() {
   historyRuleFilter = null;
+  historyFilters = defaultHistoryFilters();
+  saveHistoryFilters();
   render();
 }
 
@@ -2454,13 +2637,15 @@ function isPython(target) {
 }
 
 // Tool label for the card head: inline `python3 -c` scripts show as Python.
-// Shell tools (Bash for Claude Code/Codex, run_command for Antigravity) all
-// run a command line, so they share one label; the real name is the tooltip.
-const SHELL_TOOL_NAMES = ['Bash', 'run_command'];
+// Canonical tool names (`run`, `read`, `edit`, `ask`, ...) keep the raw
+// agent-specific tool name in the tooltip when it differs.
+const SHELL_TOOL_NAMES = ['run', 'Bash', 'run_command'];
 function toolLabel(req, target = req) {
   if (isPython(target)) return `<span class="pill python">Python</span>`;
-  if (SHELL_TOOL_NAMES.includes(req.tool)) return `<strong title="${esc(req.tool)}">run</strong>`;
-  return `<strong>${esc(req.tool)}</strong>`;
+  const shown = SHELL_TOOL_NAMES.includes(req.tool) ? 'run' : req.tool;
+  const raw = req.raw_tool || (shown !== req.tool ? req.tool : '');
+  const tip = raw && raw !== shown ? ` title="${esc(raw)}"` : '';
+  return `<strong${tip}>${esc(shown)}</strong>`;
 }
 
 // Keep the full source in the DOM; CSS limits the visible preview.
@@ -2468,14 +2653,76 @@ function renderPythonScript(script) {
   return `<pre class="py-script">${esc(script)}</pre>`;
 }
 
+const PATH_ARG_KEYS = ['Path', 'file_path', 'path', 'TargetFile', 'DirectoryPath', 'SearchPath'];
+
+function extractPathArg(args) {
+  if (!args) return null;
+  for (const key of PATH_ARG_KEYS) {
+    const val = args[key];
+    if (typeof val === 'string' && val.trim()) return val;
+  }
+  return null;
+}
+
+function callSummary(req) {
+  const args = req.arguments || {};
+  if (typeof args.command === 'string') {
+    const label = req.tool === 'apply_patch' ? 'Copy patch' : 'Copy command';
+    return { text: args.command, copyText: args.command, copyLabel: label };
+  }
+  if (typeof args.CommandLine === 'string') {
+    return { text: args.CommandLine, copyText: args.CommandLine, copyLabel: 'Copy command' };
+  }
+  if (req.tool === 'web_search' || req.tool === 'search_web') {
+    const d = args.domain ? `[${args.domain}] ` : '';
+    const q = String(args.query || '');
+    return { text: `${d}${q}`, copyText: q || `${d}${q}`, copyLabel: 'Copy query' };
+  }
+  if (req.tool === 'web_fetch') {
+    const u = args.url || args.Url;
+    if (typeof u === 'string' && u) return { text: u, copyText: u, copyLabel: 'Copy URL' };
+  }
+  if (req.tool === 'webrun') {
+    const parts = [];
+    for (const [op, items] of Object.entries(args)) {
+      if (!Array.isArray(items)) continue;
+      for (const it of items) {
+        const o = it || {};
+        const what = o.q != null ? o.q : (o.ref_id != null ? o.ref_id : JSON.stringify(o));
+        parts.push(`${op}: ${what}${o.pattern != null ? ` [${o.pattern}]` : ''}`);
+      }
+    }
+    const d = (req.domains || []).length ? `[${req.domains.join(', ')}${req.domains_unresolved ? ', ?' : ''}] ` : '';
+    const text = d + parts.join('\\n');
+    return { text, copyText: text, copyLabel: 'Copy call' };
+  }
+  const p = extractPathArg(args);
+  if (p !== null) {
+    const s = args.StartLine;
+    const e = args.EndLine;
+    const pat = args.pattern || args.Query || args.Pattern;
+    let text = (s || e) ? `${p} (L${s || 1}-${e || ''})` : p;
+    if (typeof pat === 'string' && pat) text += ` [${pat}]`;
+    return { text, copyText: p, copyLabel: 'Copy path' };
+  }
+  const json = JSON.stringify(args, null, 2);
+  return { text: json, copyText: json, copyLabel: 'Copy args' };
+}
+
+function formatArgs(req) {
+  return callSummary(req).text;
+}
+
 // Body of a card: the script for Python, otherwise the formatted call.
 // `meta` (queue cards: working directory; history: wait and time) goes
 // right-aligned on the copy-button line.
 function renderCallBody(req, target, key, meta = '') {
-  const command = target === req ? formatArgs(req) : target.command;
+  const info = target === req
+    ? callSummary(req)
+    : { text: target.command, copyText: target.command, copyLabel: 'Copy command' };
   // Long commands are clipped like Python scripts; the copy buttons hold the full text.
-  const body = isPython(target) ? renderPythonScript(target.python_script) : `<pre class="call-cmd">${esc(command)}</pre>`;
-  const buttons = [copyBtn(key + '-cmd', 'Copy command', command)];
+  const body = isPython(target) ? renderPythonScript(target.python_script) : `<pre class="call-cmd">${esc(info.text)}</pre>`;
+  const buttons = [copyBtn(key + '-cmd', info.copyLabel, info.copyText)];
   if (isPython(target)) buttons.push(copyBtn(key + '-py', 'Copy script', target.python_script));
   if (target !== req) buttons.push(copyBtn(key + '-full', 'Copy full command', formatArgs(req)));
   return body + `<div class="copy-bar">${buttons.join('')}${meta ? `<div class="meta copy-meta">${meta}</div>` : ''}</div>`;
@@ -2505,41 +2752,6 @@ async function copyText(key, btn) {
   btn.textContent = 'Copied ✓';
   btn.disabled = true;
   setTimeout(() => { btn.textContent = label; btn.disabled = false; }, 1200);
-}
-
-function formatArgs(req) {
-  if (req.arguments && typeof req.arguments.command === 'string') {
-    return req.arguments.command;
-  }
-  if (req.arguments && typeof req.arguments.CommandLine === 'string') {
-    return req.arguments.CommandLine;
-  }
-  if (req.arguments && req.tool === 'search_web') {
-    const d = req.arguments.domain ? `[${req.arguments.domain}] ` : '';
-    return `${d}${req.arguments.query || ''}`;
-  }
-  if (req.arguments && req.tool === 'webrun') {
-    const parts = [];
-    for (const [op, items] of Object.entries(req.arguments)) {
-      if (!Array.isArray(items)) continue;
-      for (const it of items) {
-        const o = it || {};
-        const what = o.q != null ? o.q : (o.ref_id != null ? o.ref_id : JSON.stringify(o));
-        parts.push(`${op}: ${what}${o.pattern != null ? ` [${o.pattern}]` : ''}`);
-      }
-    }
-    const d = (req.domains || []).length ? `[${req.domains.join(', ')}${req.domains_unresolved ? ', ?' : ''}] ` : '';
-    return d + parts.join('\n');
-  }
-  if (req.arguments) {
-    const p = req.arguments.Path || req.arguments.file_path || req.arguments.path;
-    if (typeof p === 'string') {
-      const s = req.arguments.StartLine;
-      const e = req.arguments.EndLine;
-      return (s || e) ? `${p} (L${s || 1}-${e || ''})` : p;
-    }
-  }
-  return JSON.stringify(req.arguments || {}, null, 2);
 }
 
 // Token bars start in Approve mode; the label toggles a card's bar to Deny
@@ -2660,15 +2872,67 @@ function renderReviewBox(review, autoHtml = '') {
 // only after a review (its verdict is applied); other requests are accepted
 // for 12h (exact call). Typing a reason cancels the shown request's
 // auto-decision for good.
-// The Android app (User-Agent token "aap-ui-app/<version>") never
-// auto-decides: its WebView may run in the background, unseen.
+// The Android app (User-Agent token "aap-ui-app/<version>") defaults
+// auto-decide to off: its WebView may run in the background, unseen.
+// When the app exposes window.AapPrefs (on-device SharedPreferences bridge),
+// preferences survive quick-tunnel domain changes; otherwise localStorage is used.
 const IN_APP = /\\baap-ui-app\\//.test(navigator.userAgent);
+const AUTO_DECIDE_STORAGE_KEY = 'aap-ui:auto-decide';
 const AUTO_IDLE_MS = 10000;
 const AUTO_DECIDE_MS = 30000;
 const autoCancelled = new Set();
 const autoFired = new Set();
 let autoCurrent = null;  // {key, reqId, subIndex, decision, allowAlways, verb, review, deadline|null}
 let lastActivity = Date.now();
+
+function prefGet(key) {
+  try {
+    if (window.AapPrefs && typeof window.AapPrefs.getItem === 'function') {
+      return window.AapPrefs.getItem(key);
+    }
+  } catch (e) {}
+  try {
+    return localStorage.getItem(key);
+  } catch (e) {}
+  return null;
+}
+
+function prefSet(key, value) {
+  try {
+    if (window.AapPrefs && typeof window.AapPrefs.setItem === 'function') {
+      window.AapPrefs.setItem(key, String(value));
+      return;
+    }
+  } catch (e) {}
+  try {
+    localStorage.setItem(key, String(value));
+  } catch (e) {}
+}
+
+function loadAutoDecidePref() {
+  const saved = prefGet(AUTO_DECIDE_STORAGE_KEY);
+  if (saved === '1') return true;
+  if (saved === '0') return false;
+  return !IN_APP;
+}
+
+function saveAutoDecidePref(enabled) {
+  prefSet(AUTO_DECIDE_STORAGE_KEY, enabled ? '1' : '0');
+}
+
+let autoDecideEnabled = loadAutoDecidePref();
+const autoDecideToggle = document.getElementById('auto-decide-toggle');
+if (autoDecideToggle) {
+  autoDecideToggle.checked = autoDecideEnabled;
+  autoDecideToggle.addEventListener('change', () => {
+    autoDecideEnabled = autoDecideToggle.checked;
+    saveAutoDecidePref(autoDecideEnabled);
+    if (!autoDecideEnabled) autoCurrent = null;
+    noteActivity();
+    queueMarkup = null;
+    render();
+  });
+}
 
 function noteActivity() {
   lastActivity = Date.now();
@@ -2693,7 +2957,7 @@ document.addEventListener('keydown', e => {
 });
 
 function autoAction(req, target, subIndex) {
-  if (IN_APP || req.status !== 'pending') return null;
+  if (!autoDecideEnabled || req.status !== 'pending') return null;
   const base = req.id + '#' + (subIndex === null ? '' : subIndex);
   if (target.python_script != null) {
     const r = target.review;
@@ -2766,6 +3030,7 @@ function updateAutoCounts(now = Date.now()) {
 }
 
 async function autoDecideTick() {
+  if (!autoDecideEnabled) return;
   const now = Date.now();
   const a = autoCurrent;
   if (a && a.deadline === null && now - lastActivity >= AUTO_IDLE_MS) a.deadline = now + AUTO_DECIDE_MS;
@@ -2835,7 +3100,7 @@ function renderQueue() {
           <div class="card">
             <div class="card-head">
               <div><span class="pill ${esc(rt)}">${esc(rt)}</span> ${toolLabel(req, sc)} <span class="pill">step ${sc.index + 1}/${req.subcommands.length}</span>${stalePill}</div>
-              <div class="meta">${renderAutoDecide(auto)}<span>${esc(req.created_at)}</span></div>
+              <div class="meta">${renderAutoDecide(auto)}<span title="${esc(fmtDateTime(req.created_at))}">${esc(fmtHumanTime(req.created_at))}</span></div>
             </div>
             ${renderCallBody(req, sc, 'q-' + req.id + '-' + sc.index, `<span>${esc(cwd)}</span>`)}
             <details class="full-cmd-box" ${openScripts.has('full-' + req.id) ? 'open' : ''} ontoggle="if (this.open) openScripts.add('full-${esc(req.id)}'); else openScripts.delete('full-${esc(req.id)}')"><summary>Full command</summary><pre>${esc(formatArgs(req))}</pre></details>
@@ -2865,7 +3130,7 @@ function renderQueue() {
       <div class="card">
         <div class="card-head">
           <div><span class="pill ${esc(rt)}">${esc(rt)}</span> ${toolLabel(req)}${stalePill}</div>
-          <div class="meta">${renderAutoDecide(auto)}<span>${esc(req.created_at)}</span></div>
+          <div class="meta">${renderAutoDecide(auto)}<span title="${esc(fmtDateTime(req.created_at))}">${esc(fmtHumanTime(req.created_at))}</span></div>
         </div>
         ${renderCallBody(req, req, 'q-' + req.id, `<span>${esc(cwd)}</span>`)}
         ${renderReviewBox(req.review)}
@@ -2905,11 +3170,21 @@ function queueStep(delta) {
   render();
 }
 
+function exactRuleSummary(r) {
+  const args = r.arguments || {};
+  return args.command || args.CommandLine || extractPathArg(args) || args.url || args.Url || args.query || `${r.tool} ${JSON.stringify(args)}`;
+}
+
 function formatCommandRule(r) {
   if (r.kind === 'tool') return '*';
   if (r.kind === 'command_prefix' || r.kind === 'path_prefix' || r.kind === 'domain') return (r.prefix || '').trim();
-  const args = r.arguments || {};
-  return args.command || args.CommandLine || JSON.stringify(args);
+  return exactRuleSummary(r);
+}
+
+function ruleDisplayLabel(r) {
+  if (!r) return '';
+  if (r.kind === 'tool') return r.tool;
+  return formatCommandRule(r) || r.tool || r.id;
 }
 
 const ICON_PENCIL = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5 4 4M4 20l4-1L20 7a2.8 2.8 0 0 0-4-4L4 15z"/></svg>';
@@ -2923,12 +3198,15 @@ function actionBadge(action) {
 }
 
 function hitsLink(r) {
-  return `<a href="#history" class="pill hits-pill hits-link" onclick="openRuleHistory('${esc(r.id)}');return false;" title="Show history for this rule">${Number(r.hits || 0)}</a>`;
+  const total = Number(r.hits || 0);
+  const recent = Number(r.hits_3d || 0);
+  const tip = `Hits: ${recent} in last 3 days / ${total} total · Show history for this rule`;
+  return `<a href="#history" class="pill hits-pill hits-link" onclick="openRuleHistory('${esc(r.id)}');return false;" title="${esc(tip)}">${recent}/${total}</a>`;
 }
 
 function pathModeOf(r) {
   if (r.mode === 'ro' || r.mode === 'rw') return r.mode;
-  const rwTools = new Set(['edit_file', 'write_file', 'write_to_file', 'replace_file_content', 'multi_replace_file_content', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'apply_patch']);
+  const rwTools = new Set(['edit', 'write', 'edit_file', 'write_file', 'write_to_file', 'replace_file_content', 'multi_replace_file_content', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'apply_patch']);
   return rwTools.has(r.tool) ? 'rw' : 'ro';
 }
 
@@ -2972,10 +3250,12 @@ function renderRuleCard(r, editable = false) {
     : '';
   const hitsBadge = hitsLink(r);
   const hl = highlightedRuleId === r.id ? ' rule-highlight' : '';
+  const added = fmtRuleAdded(r.created_at);
+  const titleAttr = added ? ` title="${esc(added)}"` : '';
   return `
-    <div class="card rule-card${hl}" id="rule-${esc(r.id)}">
+    <div class="card rule-card${hl}" id="rule-${esc(r.id)}"${titleAttr}>
       <div class="card-head">
-        <div class="btn-group">${hitsBadge}${editBtn}<button class="del-btn icon-btn" onclick="deleteRule('${esc(r.id)}')" title="Delete" aria-label="Delete">${ICON_TRASH}</button></div>
+        <div class="btn-group">${ruleAddedBadge(r)}${hitsBadge}${editBtn}<button class="del-btn icon-btn" onclick="deleteRule('${esc(r.id)}')" title="Delete" aria-label="Delete">${ICON_TRASH}</button></div>
         <div>${actionBadge(r.action)} ${modeBadge}<code class="rule-code">${esc(desc)}</code></div>
       </div>
       ${r.action === 'deny' && r.reason ? `<div class="rule-reason-text">${esc(r.reason)}</div>` : ''}
@@ -2992,61 +3272,147 @@ function formatTtlLeft(iso) {
   return h ? `${h}h ${m}m` : `${m}m`;
 }
 
+function fmtDateTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return String(iso);
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${fmtTime24(d, true)}`;
+}
+
+function fmtHumanTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return String(iso);
+  const time = fmtTime24(d);
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) return time;
+  const opts = d.getFullYear() === now.getFullYear()
+    ? { month: 'short', day: 'numeric' }
+    : { year: 'numeric', month: 'short', day: 'numeric' };
+  return `${d.toLocaleDateString([], opts)}, ${time}`;
+}
+
+function fmtRuleAdded(iso) {
+  const exact = fmtDateTime(iso);
+  return exact ? `Added ${exact}` : '';
+}
+
+function ruleAddedBadge(r) {
+  const when = fmtHumanTime(r.created_at);
+  return when ? `<span class="rule-added">${esc(when)}</span>` : '';
+}
+
+const RULE_SORT_STORAGE_KEY = 'aap-ui:rule-sort-mode';
+const RULE_SORT_MODES = [
+  ['alpha', 'A–Z', 'Sort alphabetically'],
+  ['hits3d', 'Hits 3d', 'Sort by matches in the last 3 days'],
+  ['hits', 'Hits', 'Sort by total match count (most matched first)'],
+  ['newest', 'Newest', 'Sort by date added (newest first)'],
+];
+
+function loadRuleSortMode() {
+  const saved = prefGet(RULE_SORT_STORAGE_KEY);
+  if (RULE_SORT_MODES.some(([m]) => m === saved)) return saved;
+  return 'alpha';
+}
+
+let ruleSortMode = loadRuleSortMode();
+
+function setRuleSort(mode) {
+  ruleSortMode = mode;
+  prefSet(RULE_SORT_STORAGE_KEY, mode);
+  render();
+}
+
+function renderRuleSortBar() {
+  return `<span class="sort-pills" role="group" aria-label="Sort rules">` +
+    RULE_SORT_MODES.map(([mode, label, tip]) =>
+      `<button type="button" class="sort-btn${ruleSortMode === mode ? ' active' : ''}" onclick="setRuleSort('${mode}')" title="${esc(tip)}">${esc(label)}</button>`
+    ).join('') + `</span>`;
+}
+
+function sortRules(list, labelFn) {
+  return [...list].sort((a, b) => {
+    if (ruleSortMode === 'hits') {
+      const diff = Number(b.hits || 0) - Number(a.hits || 0);
+      if (diff) return diff;
+    } else if (ruleSortMode === 'hits3d') {
+      const diff = Number(b.hits_3d || 0) - Number(a.hits_3d || 0);
+      if (diff) return diff;
+    } else if (ruleSortMode === 'newest') {
+      const tb = Date.parse(b.created_at || '') || 0;
+      const ta = Date.parse(a.created_at || '') || 0;
+      if (tb !== ta) return tb - ta;
+    }
+    return labelFn(a).localeCompare(labelFn(b));
+  });
+}
+
+function ttlRuleDesc(r) {
+  return exactRuleSummary(r);
+}
+
 function renderRules() {
   if (!state.rules.length) {
-    return '<div class="empty">No saved rules yet. Click "Allow always" on any request to create one.</div>';
+    return '<div class="empty">No saved rules yet. Approve a prefix, domain, or tool on any request to create one.</div>';
   }
-  const ttlRules = state.rules
-    .filter(r => r.expires_at || r.kind === 'exact')
-    .sort((a, b) => (a.expires_at || '').localeCompare(b.expires_at || ''));
+  const ttlRules = sortRules(
+    state.rules.filter(r => r.expires_at || r.kind === 'exact'),
+    ttlRuleDesc,
+  );
   const permRules = state.rules.filter(r => !(r.expires_at || r.kind === 'exact'));
 
   const isPathRule = r => r.kind === 'path_prefix';
   const isDomainRule = r => r.kind === 'domain';
-  const isCommandRule = r => r.tool === 'run_command' || r.tool === 'Bash' || r.kind === 'command_prefix';
-  const pathRules = permRules
-    .filter(isPathRule)
-    .sort((a, b) => formatCommandRule(a).localeCompare(formatCommandRule(b)));
-  const domainRules = permRules
-    .filter(isDomainRule)
-    .sort((a, b) => formatCommandRule(a).localeCompare(formatCommandRule(b)));
-  const cmdRules = permRules
-    .filter(r => !isPathRule(r) && !isDomainRule(r) && isCommandRule(r))
-    .sort((a, b) => formatCommandRule(a).localeCompare(formatCommandRule(b)));
-  const toolPills = permRules
-    .filter(r => !isPathRule(r) && !isDomainRule(r) && !isCommandRule(r))
-    .sort((a, b) => (a.tool || '').localeCompare(b.tool || ''));
+  const isCommandRule = r => r.tool === 'run' || r.tool === 'run_command' || r.tool === 'Bash' || r.kind === 'command_prefix';
+  const pathRules = sortRules(permRules.filter(isPathRule), formatCommandRule);
+  const domainRules = sortRules(permRules.filter(isDomainRule), formatCommandRule);
+  const cmdRules = sortRules(
+    permRules.filter(r => !isPathRule(r) && !isDomainRule(r) && isCommandRule(r)),
+    formatCommandRule,
+  );
+  const toolPills = sortRules(
+    permRules.filter(r => !isPathRule(r) && !isDomainRule(r) && !isCommandRule(r)),
+    r => r.tool || '',
+  );
 
   let html = '';
+  const sortBar = renderRuleSortBar();
   if (toolPills.length) {
-    html += `<section><h2 class="panel-title"><span>Tools</span></h2><div class="chip-row">` + toolPills.map(r => `
-      <span class="rule-chip${highlightedRuleId === r.id ? ' rule-highlight' : ''}" id="rule-${esc(r.id)}">
+    html += `<section><h2 class="panel-title"><span>Tools</span>${sortBar}</h2><div class="chip-row">` + toolPills.map(r => {
+      const added = fmtRuleAdded(r.created_at);
+      const titleAttr = added ? ` title="${esc(added)}"` : '';
+      return `
+      <span class="rule-chip${highlightedRuleId === r.id ? ' rule-highlight' : ''}" id="rule-${esc(r.id)}" style="flex-grow:${(r.tool || '').length + 18}"${titleAttr}>
         ${actionBadge(r.action)}
         <code class="rule-code">${esc(r.tool)}</code>
         ${hitsLink(r)}
         <button class="del-btn icon-btn" onclick="deleteRule('${esc(r.id)}')" title="Delete" aria-label="Delete">${ICON_TRASH}</button>
-      </span>`).join('') + `</div></section>`;
+      </span>`;
+    }).join('') + `</div></section>`;
   }
   if (pathRules.length) {
-    html += `<section><h2 class="panel-title"><span>Paths</span></h2>` + pathRules.map(r => renderRuleCard(r, true)).join('') + `</section>`;
+    html += `<section><h2 class="panel-title"><span>Paths</span>${sortBar}</h2>` + pathRules.map(r => renderRuleCard(r, true)).join('') + `</section>`;
   }
   if (domainRules.length) {
-    html += `<section><h2 class="panel-title"><span>Domains</span></h2>` + domainRules.map(r => renderRuleCard(r, true)).join('') + `</section>`;
+    html += `<section><h2 class="panel-title"><span>Domains</span>${sortBar}</h2>` + domainRules.map(r => renderRuleCard(r, true)).join('') + `</section>`;
   }
   if (cmdRules.length) {
-    html += `<section><h2 class="panel-title"><span>Commands</span></h2>` + cmdRules.map(r => renderRuleCard(r, true)).join('') + `</section>`;
+    html += `<section><h2 class="panel-title"><span>Commands</span>${sortBar}</h2>` + cmdRules.map(r => renderRuleCard(r, true)).join('') + `</section>`;
   }
   if (ttlRules.length) {
-    html += `<section><h2 class="panel-title"><span>Approved (12h TTL)</span></h2>` + ttlRules.map(r => {
-      const args = r.arguments || {};
-      const cmd = args.command || args.CommandLine;
-      const desc = cmd || `${r.tool} ${JSON.stringify(args)}`;
+    html += `<section><h2 class="panel-title"><span>Approved (12h TTL)</span>${sortBar}</h2>` + ttlRules.map(r => {
+      const desc = ttlRuleDesc(r);
       const ttl = formatTtlLeft(r.expires_at);
+      const added = fmtRuleAdded(r.created_at);
+      const cardTitle = added ? ` title="${esc(added)}"` : '';
+      const codeTitle = added ? `${desc}\\n\\n${added}` : desc;
       return `
-        <div class="card rule-card${highlightedRuleId === r.id ? ' rule-highlight' : ''}" id="rule-${esc(r.id)}">
+        <div class="card rule-card${highlightedRuleId === r.id ? ' rule-highlight' : ''}" id="rule-${esc(r.id)}"${cardTitle}>
           <div class="card-head">
-            <div class="btn-group">${hitsLink(r)}<button class="del-btn icon-btn" onclick="deleteRule('${esc(r.id)}')" title="Delete" aria-label="Delete">${ICON_TRASH}</button></div>
-            <div class="ttl-row"><span class="pill">${esc(ttl)}</span><code class="rule-code ttl-code" title="${esc(desc)}">${esc(desc)}</code></div>
+            <div class="btn-group">${ruleAddedBadge(r)}${hitsLink(r)}<button class="del-btn icon-btn" onclick="deleteRule('${esc(r.id)}')" title="Delete" aria-label="Delete">${ICON_TRASH}</button></div>
+            <div class="ttl-row"><span class="pill">${esc(ttl)}</span><code class="rule-code ttl-code" title="${esc(codeTitle)}">${esc(desc)}</code></div>
           </div>
         </div>`;
     }).join('') + `</section>`;
@@ -3131,29 +3497,56 @@ function render() {
   } else if (activeTab === 'usage') {
     app.innerHTML = renderUsage();
   } else {
-    let filterBanner = '';
-    let items = state.history;
-    if (historyRuleFilter) {
-      const ruleObj = state.rules.find(r => r.id === historyRuleFilter);
-      const label = ruleObj ? formatCommandRule(ruleObj) : historyRuleFilter;
-      filterBanner = `
-        <div class="filter-bar">
-          <span>Filtered by rule: <code class="rule-code">${esc(label)}</code></span>
-          <button class="ghost" onclick="clearHistoryFilter()">Clear filter</button>
-        </div>`;
-      items = state.history.filter(req => {
-        const d = req.decision || {};
-        if (d.rule_id === historyRuleFilter) return true;
-        if (Array.isArray(d.rule_ids) && d.rule_ids.includes(historyRuleFilter)) return true;
-        if (Array.isArray(req.subcommands) && req.subcommands.some(sc => sc.rule_id === historyRuleFilter)) return true;
-        return false;
-      });
+    const hasFilter = Boolean(
+      historyRuleFilter
+      || historyFilters.status !== 'all'
+      || historyFilters.source !== 'all'
+    );
+    const items = state.history.filter(req => {
+      const d = req.decision || {};
+      const labels = Array.isArray(d.labels) ? d.labels : [];
+      if (historyRuleFilter) {
+        const hitRule = d.rule_id === historyRuleFilter
+          || (Array.isArray(d.rule_ids) && d.rule_ids.includes(historyRuleFilter))
+          || (Array.isArray(req.subcommands) && req.subcommands.some(sc => sc.rule_id === historyRuleFilter));
+        if (!hitRule) return false;
+      }
+      if (historyFilters.status === 'approved' && req.status !== 'approved') return false;
+      if (historyFilters.status === 'denied' && req.status !== 'denied') return false;
+      if (historyFilters.status === 'other' && (req.status === 'approved' || req.status === 'denied')) return false;
+      if (historyFilters.source === 'non-rule' && (labels.includes('rule') || labels.includes('prior'))) return false;
+      if (historyFilters.source === 'lazy' && !labels.includes('lazy')) return false;
+      if (historyFilters.source === 'click' && !labels.includes('click')) return false;
+      if (historyFilters.source === 'ai-review' && !labels.includes('ai-review') && !isPython(req)) return false;
+      if (historyFilters.source === 'rule' && !labels.includes('rule') && !labels.includes('prior')) return false;
+      return true;
+    });
+
+    const renderFilterPills = (key, ariaLabel, modes) =>
+      `<span class="sort-pills" role="group" aria-label="${esc(ariaLabel)}">` +
+      modes.map(([mode, label, tip = '']) =>
+        `<button type="button" class="sort-btn${historyFilters[key] === mode ? ' active' : ''}" onclick="setHistoryFilter('${key}','${mode}')"${tip ? ` title="${esc(tip)}"` : ''}>${esc(label)}</button>`
+      ).join('') + `</span>`;
+
+    let filterBar = '';
+    if (state.history.length || hasFilter) {
+      const statusPills = renderFilterPills('status', 'Filter by status', HISTORY_STATUS_MODES);
+      const sourcePills = renderFilterPills('source', 'Filter by decision source', HISTORY_SOURCE_MODES);
+      const countText = hasFilter ? `${items.length}/${state.history.length}` : `${state.history.length}`;
+      const clearBtn = hasFilter ? `<button type="button" class="ghost filter-clear" onclick="clearHistoryFilter()">Clear</button>` : '';
+      let ruleRow = '';
+      if (historyRuleFilter) {
+        const ruleObj = state.rules.find(r => r.id === historyRuleFilter);
+        const label = ruleObj ? ruleDisplayLabel(ruleObj) : historyRuleFilter;
+        ruleRow = `<div class="filter-row"><span>Rule: <code class="rule-code">${esc(label)}</code></span><button type="button" class="ghost filter-clear" onclick="clearHistoryRuleFilter()" title="Remove rule filter" aria-label="Remove rule filter">×</button></div>`;
+      }
+      filterBar = `<div class="filter-bar"><div class="filter-row">${statusPills}${sourcePills}<span class="filter-meta"><span>${countText}</span>${clearBtn}</span></div>${ruleRow}</div>`;
     }
     if (!items.length) {
-      app.innerHTML = filterBanner + `<div class="empty">${historyRuleFilter ? 'No history entries for this rule.' : 'No decisions yet.'}</div>`;
+      app.innerHTML = filterBar + `<div class="empty">${hasFilter ? 'No history entries match the active filters.' : 'No decisions yet.'}</div>`;
       return;
     }
-    app.innerHTML = filterBanner + items.map(req => {
+    app.innerHTML = filterBar + items.map(req => {
       const rt = (req.context && req.context.runtime) || 'agent';
       const d = req.decision || {};
       // Generated reasons ("Matched rule (...)", "Approved in UI", ...) are
@@ -3170,7 +3563,7 @@ function render() {
       const ruleLinks = ruleIds.map(rid => {
         const ruleObj = state.rules.find(r => r.id === rid);
         if (!ruleObj) return '';
-        const lbl = ruleObj.kind === 'tool' ? ruleObj.tool : (formatCommandRule(ruleObj) || ruleObj.tool || rid);
+        const lbl = ruleDisplayLabel(ruleObj) || rid;
         return `<a href="#rule-${esc(rid)}" class="rule-jump-link" onclick="jumpToRule('${esc(rid)}');return false;" title="Jump to rule: ${esc(lbl)}">↳ ${esc(lbl)}</a>`;
       }).filter(Boolean).join(' ');
       return `
@@ -3179,7 +3572,7 @@ function render() {
             <div><span class="pill ${esc(rt)}">${esc(rt)}</span> ${toolLabel(req)} <span class="status-${esc(req.status)}">${esc(req.status)}</span>${renderDecisionLabels(req)}</div>
             <div class="meta">${ruleLinks}<span>${esc(reason)}</span></div>
           </div>
-          ${renderCallBody(req, req, 'h-' + req.id, `${fmtWaited(req)}<span>${esc(req.created_at)}</span>`)}
+          ${renderCallBody(req, req, 'h-' + req.id, `${fmtWaited(req)}<span title="${esc(fmtDateTime(req.created_at))}">${esc(fmtHumanTime(req.created_at))}</span>`)}
         </div>`;
     }).join('');
   }

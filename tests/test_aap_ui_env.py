@@ -131,6 +131,38 @@ class CommandEnvironmentTests(unittest.TestCase):
             aap_ui.extract_python_c_script("FOO=bar echo python3 -c 'print(1)'")
         )
 
+    def test_timeout_moves_leading_assignments_to_the_wrapped_command(self):
+        command = "FITPANDA_TEST_URL=http://localhost:18123 timeout 300 python abc"
+        parts = aap_ui.parse_shell_command(command)
+        self.assertEqual(
+            [(p.text, p.words, p.assignments, p.operator_after) for p in parts],
+            [
+                ("timeout 300", ["timeout", "300"], 0, ""),
+                (
+                    "FITPANDA_TEST_URL=http://localhost:18123 python abc",
+                    ["FITPANDA_TEST_URL=http://localhost:18123", "python", "abc"],
+                    1,
+                    "",
+                ),
+            ],
+        )
+        # `timeout *` matches step 1, while step 2 keeps the env assignment so bare `python *` cannot match.
+        self.assertTrue(aap_ui._command_matches_prefix(parts[0].text, "timeout *"))
+        self.assertFalse(aap_ui._command_matches_prefix(parts[1].text, "python *"))
+        self.assertTrue(
+            aap_ui._command_matches_prefix(
+                parts[1].text, "FITPANDA_TEST_URL=http://localhost:18123 python *"
+            )
+        )
+
+        multi = aap_ui.parse_shell_command("FOO='two words' CI=1 timeout 30 python abc && echo done")
+        self.assertEqual(
+            [p.text for p in multi],
+            ["timeout 30", "FOO='two words' CI=1 python abc", "echo done"],
+        )
+        self.assertEqual(multi[1].assignments, 2)
+        self.assertEqual([p.operator_after for p in multi], ["", "&&", ""])
+
 
 if __name__ == "__main__":
     unittest.main()

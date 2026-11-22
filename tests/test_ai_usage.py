@@ -34,8 +34,8 @@ class SummaryTests(unittest.TestCase):
 
         scores = usage.agent_scores(results, now)
         self.assertLess(scores['claude'], 0)
-        self.assertEqual(scores['agy-gemini'], 0)
-        self.assertEqual(scores['agy-argon'], 0)
+        self.assertAlmostEqual(scores['agy-gemini'], -100 * 0.75 / 8)
+        self.assertAlmostEqual(scores['agy-argon'], -100 * 0.75 / 8)
         with patch.object(usage, 'now_local', return_value=now):
             data = usage.usage_data(results=results)
             raw_summary = usage.summary_line(data)
@@ -53,7 +53,10 @@ class SummaryTests(unittest.TestCase):
                                   duration=usage.ONE_WEEK),
             ]),
         ])
-        self.assertEqual(usage.agent_scores({'codex': result}, now)['codex'], -50)
+        self.assertAlmostEqual(
+            usage.agent_scores({'codex': result}, now)['codex'],
+            -100 * 4.25 / 8,
+        )
 
     def test_five_hour_window_uses_six_hour_progress(self):
         now = dt.datetime(2026, 11, 15, 0, 0, tzinfo=dt.timezone.utc)
@@ -78,10 +81,74 @@ class SummaryTests(unittest.TestCase):
         )
         self.assertAlmostEqual(w5_after_reset.expected(now), 100.0)
 
-        w7 = usage.UsageWindow(
-            'Weekly', 50, now + dt.timedelta(days=3.5), duration=usage.ONE_WEEK
+        other = usage.UsageWindow(
+            'Daily', 50, now + dt.timedelta(hours=12),
+            duration=dt.timedelta(days=1),
         )
-        self.assertAlmostEqual(w7.expected(now), 50.0)
+        self.assertAlmostEqual(other.expected(now), 50.0)
+
+    def test_weekly_window_uses_eight_day_progress(self):
+        now = dt.datetime(2026, 11, 15, 0, 0, tzinfo=dt.timezone.utc)
+        w7_mid = usage.UsageWindow(
+            'Weekly', 50, now + dt.timedelta(days=3, hours=18),
+            duration=usage.ONE_WEEK,
+        )
+        self.assertAlmostEqual(w7_mid.expected(now), 50.0)
+
+        w7_start = usage.UsageWindow(
+            'Weekly', 10, now + usage.ONE_WEEK, duration=usage.ONE_WEEK
+        )
+        self.assertAlmostEqual(w7_start.expected(now), 100 * 0.75 / 8)
+
+        w7_at_reset = usage.UsageWindow(
+            'Weekly', 90, now, duration=usage.ONE_WEEK
+        )
+        self.assertAlmostEqual(w7_at_reset.expected(now), 100 * 7.75 / 8)
+
+        w7_after_reset = usage.UsageWindow(
+            'Weekly', 90, now - dt.timedelta(hours=6), duration=usage.ONE_WEEK
+        )
+        self.assertAlmostEqual(w7_after_reset.expected(now), 100.0)
+
+    def test_session_pace_shortens_to_earlier_weekly_reset(self):
+        now = dt.datetime(2026, 11, 18, 21, 17, tzinfo=dt.timezone.utc)
+        session = usage.UsageWindow(
+            '5h', 39, now + dt.timedelta(hours=4, minutes=23),
+            duration=usage.FIVE_HOURS,
+        )
+        weekly = usage.UsageWindow(
+            'Weekly', 81, now + dt.timedelta(hours=2, minutes=25),
+            duration=usage.ONE_WEEK,
+        )
+        group = usage.UsageGroup('Codex', [session, weekly])
+        results = {'codex': usage.ProviderResult('Codex', 'test', groups=[group])}
+        # Preserve the virtual start (82 minutes ago), end at the weekly reset.
+        expected = 100 * 82 / (82 + 145)
+        self.assertAlmostEqual(group.expected(session, now), expected)
+        data = usage.usage_data(results=results, now=now)
+        window = data['providers']['codex']['groups'][0]['windows'][0]
+        self.assertEqual(window['expected_percent'], 36)
+        self.assertEqual(window['reset'], weekly.reset.isoformat())
+        self.assertIsNone(window['reset_text'])
+        self.assertAlmostEqual(data['agents']['codex'], 39 - expected)
+        self.assertAlmostEqual(group.expected(weekly, now), weekly.expected(now))
+        self.assertAlmostEqual(
+            group.expected(session, weekly.reset - dt.timedelta(seconds=1)),
+            100, delta=0.01,
+        )
+
+    def test_session_pace_ignores_later_unknown_or_expired_weekly_reset(self):
+        now = dt.datetime(2026, 11, 18, 21, 17, tzinfo=dt.timezone.utc)
+        session = usage.UsageWindow(
+            '5h', 39, now + dt.timedelta(hours=4), duration=usage.FIVE_HOURS,
+        )
+        for reset in (None, now - dt.timedelta(seconds=1), now,
+                      session.reset, now + usage.ONE_WEEK):
+            with self.subTest(reset=reset):
+                group = usage.UsageGroup('Codex', [session, usage.UsageWindow(
+                    'Weekly', 81, reset, duration=usage.ONE_WEEK,
+                )])
+                self.assertEqual(group.expected(session, now), session.expected(now))
 
     def test_failed_fetch_falls_back_to_history_within_12_minutes(self):
         t0 = dt.datetime(2026, 11, 15, 12, 0, tzinfo=dt.timezone.utc)

@@ -405,12 +405,20 @@ class AAPUITest(unittest.TestCase):
         }
         self.assertEqual(aap_ui.mobile_notifications(state, now=now), [
             {"id": "a", "title": "run: waiting", "text": "git push…"},
-            {"id": "b", "title": "Edit: waiting", "text": "/x/y.py"},
+            {"id": "b", "title": "edit: waiting", "text": "/x/y.py"},
             {"id": "d", "title": "run: waiting", "text": long_cmd[:79] + "…"},
             {"id": "e", "title": "Python: waiting", "text": "Lists files"},
             {"id": "f", "title": "run: auto-approved", "text": "ls"},
             {"id": "g", "title": "run: auto-denied", "text": "rm x"},
         ])
+        self.assertEqual(
+            aap_ui._mobile_text({"tool": "read", "arguments": {"TargetFile": "/a/b.py"}}),
+            "/a/b.py",
+        )
+        self.assertEqual(
+            aap_ui._mobile_text({"tool": "grep", "arguments": {"SearchPath": "/src", "Query": "foo"}}),
+            "/src [foo]",
+        )
 
     def test_extract_python_c_script_forms(self) -> None:
         ex = aap_ui.extract_python_c_script
@@ -426,7 +434,18 @@ class AAPUITest(unittest.TestCase):
         for path in ("/", "/rules", "/history", "/ai-usage"):
             with urllib.request.urlopen(f"{self.base_url}{path}", timeout=5.0) as resp:
                 self.assertEqual(resp.status, 200)
-                self.assertIn("aap-ui</h1>", resp.read().decode("utf-8"))
+                html = resp.read().decode("utf-8")
+                self.assertIn("aap-ui</h1>", html)
+                self.assertIn('id="auto-decide-toggle"', html)
+                self.assertIn("return !IN_APP;", html)
+                self.assertIn("setRuleSort(", html)
+                self.assertIn("Hits 3d", html)
+                self.assertIn("fmtRuleAdded(", html)
+                self.assertIn("window.AapPrefs", html)
+                self.assertIn("Copy path", html)
+                self.assertIn("ruleDisplayLabel(", html)
+                self.assertIn("setHistoryFilter(", html)
+                self.assertIn("Non-rule", html)
         for path in ("/nope", "/test"):
             with self.assertRaises(urllib.error.HTTPError):
                 urllib.request.urlopen(f"{self.base_url}{path}", timeout=5.0)
@@ -460,7 +479,9 @@ class AAPUITest(unittest.TestCase):
         # Only shell tools share command rules.
         self.assertFalse(bash_git.matches("SomeMcpTool", {"command": "git status"}))
         tool_rule = aap_ui.Rule(id="r3", kind="tool", tool="Bash", action="allow")
-        self.assertFalse(tool_rule.matches("run_command", {"CommandLine": "rm -rf /"}))
+        self.assertEqual(tool_rule.tool, "run")
+        self.assertTrue(tool_rule.matches("run_command", {"CommandLine": "rm -rf /"}))
+        self.assertFalse(tool_rule.matches("SomeMcpTool", {"command": "rm -rf /"}))
 
     def test_choose_review_agent(self) -> None:
         def usage(claude: float | None, codex: float | None) -> dict:
@@ -1059,6 +1080,12 @@ class AAPUITest(unittest.TestCase):
         self.assertEqual(history[0]["decision"]["reason"], "nope")
         self.assertEqual(reloaded.ui_state()["pending"], [])
 
+        # History retains and exposes more than 50/100 entries (up to 500)
+        for i in range(118):
+            rec, _ = reloaded.create_request({"tool": "read", "arguments": {"path": f"/tmp/f{i}"}}, f"bulk-{i}")
+            reloaded.decide_request(rec["id"], "denied", reason="bulk")
+        self.assertEqual(len(reloaded.ui_state()["history"]), 120)
+
     def test_expired_and_cancelled_stay_in_queue_until_decided_and_persist(self) -> None:
         _, exp_req = self._req(
             "POST",
@@ -1230,6 +1257,80 @@ class AAPUITest(unittest.TestCase):
         store.add_rule(aap_ui.Rule(id="d2", kind="command_prefix", tool="Bash", action="deny", prefix="git push *",
                                    reason="Ask first."))
         self.assertEqual([(r["id"], r["reason"]) for r in store.list_rules()], [("d", "Ask first.")])
+
+    def test_canonical_tool_unification_and_cross_agent_rules(self) -> None:
+        # User-question tools unify to "ask"
+        _, ask_req = self._req("POST", "/api/aap/v1/requests",
+                               {"tool": "AskUserQuestion", "arguments": {"question": "Proceed?"}},
+                               {"Idempotency-Key": "u-ask-1"})
+        self.assertEqual(ask_req["tool"], "ask")
+        self.assertEqual(ask_req["raw_tool"], "AskUserQuestion")
+        self._req("POST", f"/api/ui/requests/{ask_req['id']}/decision",
+                  {"decision": "approved", "allow_always": "tool"})
+        for alias in ("ask_question", "request_user_input_async", "request_user_input"):
+            _, r = self._req("POST", "/api/aap/v1/requests",
+                             {"tool": alias, "arguments": {"q": "ok?"}},
+                             {"Idempotency-Key": f"u-ask-{alias}"})
+            self.assertEqual(r["status"], "approved", alias)
+            self.assertEqual(r["tool"], "ask")
+
+        # Domain rules apply across WebFetch / read_url_content / webrun / search_web / WebSearch
+        _, wf = self._req("POST", "/api/aap/v1/requests",
+                          {"tool": "WebFetch", "arguments": {"url": "https://docs.python.org/3/"}},
+                          {"Idempotency-Key": "u-web-1"})
+        self.assertEqual(wf["tool"], "web_fetch")
+        self._req("POST", f"/api/ui/requests/{wf['id']}/decision",
+                  {"decision": "approved", "allow_always": "domain", "prefix": "docs.python.org"})
+        for tool_name, args in (
+            ("read_url_content", {"Url": "https://docs.python.org/3/library/"}),
+            ("webrun", {"open": [{"ref_id": "https://docs.python.org/3/howto/"}]}),
+            ("WebSearch", {"query": "site:docs.python.org asyncio"}),
+            ("search_web", {"domain": "docs.python.org", "query": "asyncio"}),
+        ):
+            _, r = self._req("POST", "/api/aap/v1/requests",
+                             {"tool": tool_name, "arguments": args},
+                             {"Idempotency-Key": f"u-web-{tool_name}"})
+            self.assertEqual(r["status"], "approved", tool_name)
+
+        # 12h exact shell approval matches across Bash (command) and run_command (CommandLine)
+        _, b = self._req("POST", "/api/aap/v1/requests",
+                         {"tool": "Bash", "arguments": {"command": "echo cross-shell"}},
+                         {"Idempotency-Key": "u-run-1"})
+        self._req("POST", f"/api/ui/requests/{b['id']}/decision", {"decision": "approved"})
+        _, rc = self._req("POST", "/api/aap/v1/requests",
+                          {"tool": "run_command", "arguments": {"CommandLine": "echo cross-shell"}},
+                          {"Idempotency-Key": "u-run-2"})
+        self.assertEqual(rc["status"], "approved")
+
+        # view_image has canonical tool "read" and ro path rules
+        _, vi = self._req("POST", "/api/aap/v1/requests",
+                          {"tool": "view_image", "arguments": {"path": "/tmp/shots/a.png"}},
+                          {"Idempotency-Key": "u-vi-1"})
+        self.assertEqual(vi["tool"], "read")
+        self.assertEqual(vi["path_mode"], "ro")
+
+    def test_hits_3d_tracks_recent_and_prunes_older_hits(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        now = int(time.time())
+        old_ts = now - 4 * 86400
+        recent_ts = now - 3600
+        store = aap_ui.RuleStore(Path(tmp.name) / "rules.json")
+        store.add_rule(aap_ui.Rule(
+            id="r1",
+            kind="tool",
+            tool="ask",
+            action="allow",
+            hits=10,
+            recent_hits=[old_ts, old_ts + 10, recent_ts],
+        ))
+        listed = store.list_rules()
+        self.assertEqual(listed[0]["hits"], 10)
+        self.assertEqual(listed[0]["hits_3d"], 1)
+        self.assertIsNotNone(store.match("ask_question", {}))
+        listed_after = store.list_rules()
+        self.assertEqual(listed_after[0]["hits"], 11)
+        self.assertEqual(listed_after[0]["hits_3d"], 2)
 
 
 if __name__ == "__main__":
