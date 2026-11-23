@@ -34,6 +34,23 @@ The layout adapts to the terminal: the words `used` and `resets` disappear
 when columns run out, the header and blank lines disappear when rows run out,
 and the screen is redrawn on resize.
 
+## cf_share_file.py
+
+Share one file over the internet through a Cloudflare quick tunnel. Requires
+Python 3.9+ (standard library only) and `cloudflared` in `PATH`.
+
+```bash
+./cf_share_file.py file.pdf
+./cf_share_file.py file.pdf --auth user:password   # require HTTP Basic Auth
+./cf_share_file.py file.pdf --port 8000            # fixed local port (default: random)
+```
+
+It serves only that file at `/<file name>` on 127.0.0.1 (other paths get 404),
+starts `cloudflared tunnel --url ...` and prints the public
+`https://….trycloudflare.com/<file name>` URL. A new tunnel URL may need a few
+seconds before DNS resolves. Ctrl+C stops the server and the tunnel. The
+`--auth` password is visible in `ps` and shell history.
+
 ## prefix-cleanup
 
 Interactively shorten allowed Codex prefixes to two elements (a command and one
