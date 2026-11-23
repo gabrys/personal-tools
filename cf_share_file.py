@@ -37,7 +37,7 @@ def make_handler(path: str, url_path: str, auth: str | None):
                 self.headers.get("Authorization", "").encode(), expected.encode()
             ):
                 self.send_response(401)
-                self.send_header("WWW-Authenticate", 'Basic realm="cf_share_file"')
+                self.send_header("WWW-Authenticate", 'Basic realm="restricted"')
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
